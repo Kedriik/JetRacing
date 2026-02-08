@@ -1,0 +1,28 @@
+#include "/Engine/Public/Platform.ush"
+
+// Input/Output buffers
+RWStructuredBuffer<float4> SpawnPositions;
+float Time;
+float SpawnRadius;
+uint NumInstances;
+
+[numthreads(64, 1, 1)]
+void MainCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+    float PI = 3.1415;
+    uint Index = ThreadId.x;
+    SpawnPositions[Index] = float4(0.0, 0.0, 1000000.0, 1.0);
+    return;
+    if (Index >= NumInstances)
+        return;
+    
+    // Generate pseudo-random positions based on index and time
+    float Angle = (float)Index / (float)NumInstances * 2.0 * PI + Time;
+    float RadiusVariation = sin((float)Index * 0.1 + Time) * 0.5 + 0.5;
+    
+    float X = cos(Angle) * SpawnRadius * RadiusVariation;
+    float Y = sin(Angle) * SpawnRadius * RadiusVariation;
+    float Z = sin((float)Index * 0.5 + Time) * 100.0;
+    
+    SpawnPositions[Index] = float4(X, Y, Z, 1.0);
+}
