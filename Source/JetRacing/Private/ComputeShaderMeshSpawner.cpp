@@ -6,6 +6,8 @@
 #include "RHIResources.h"
 #include "GlobalShader.h"
 #include "RenderingThread.h"
+#include "Engine/TextureRenderTarget2D.h"
+#include "Components/SceneCaptureComponent2D.h"
 
 UComputeShaderMeshSpawner::UComputeShaderMeshSpawner()
 {
@@ -18,17 +20,17 @@ void UComputeShaderMeshSpawner::BeginPlay()
 
     InstancedMeshComponent = NewObject<UInstancedStaticMeshComponent>(GetOwner(), TEXT("ComputeShaderISMC"));
     InstancedMeshComponent->RegisterComponent();
-    InstancedMeshComponent->AttachToComponent(
-        GetOwner()->GetRootComponent(),
-        FAttachmentTransformRules::KeepRelativeTransform
-    );
-
-    if (MeshToSpawn)
+    InstancedMeshComponent->AttachToComponent(GetOwner()->GetRootComponent(), FAttachmentTransformRules::KeepRelativeTransform);
+    
+    if (FoliageMesh)
     {
-        InstancedMeshComponent->SetStaticMesh(MeshToSpawn);
+        InstancedMeshComponent->SetStaticMesh(FoliageMesh);
     }
 
+    SetupDepthCapture();
     CreateBuffers();
+    
+    CaptureDepth();
     ExecuteComputeShader();
 }
 
@@ -38,12 +40,48 @@ void UComputeShaderMeshSpawner::EndPlay(const EEndPlayReason::Type EndPlayReason
     ReleaseBuffers();
 }
 
+void UComputeShaderMeshSpawner::SetupDepthCapture()
+{
+    if (!DepthRenderTarget)
+    {
+        DepthRenderTarget = NewObject<UTextureRenderTarget2D>();
+        DepthRenderTarget->RenderTargetFormat = RTF_R32f;
+        DepthRenderTarget->InitAutoFormat(2048, 2048);
+        DepthRenderTarget->UpdateResourceImmediate(true);
+    }
+
+    SceneCaptureComponent = NewObject<USceneCaptureComponent2D>(GetOwner(), TEXT("DepthCaptureComp"));
+    SceneCaptureComponent->RegisterComponent();
+    SceneCaptureComponent->AttachToComponent(GetOwner()->GetRootComponent(), FAttachmentTransformRules::KeepRelativeTransform);
+    
+    SceneCaptureComponent->TextureTarget = DepthRenderTarget;
+    SceneCaptureComponent->CaptureSource = SCS_SceneDepth;
+    SceneCaptureComponent->bCaptureEveryFrame = true;
+    SceneCaptureComponent->bCaptureOnMovement = false;
+    
+    SceneCaptureComponent->SetWorldLocation(CameraLocation);
+    SceneCaptureComponent->SetWorldRotation(CameraRotation);
+    
+    SceneCaptureComponent->ProjectionType = ECameraProjectionMode::Orthographic;
+    SceneCaptureComponent->OrthoWidth = OrthoWidth;
+}
+
+void UComputeShaderMeshSpawner::CaptureDepth()
+{
+    if (SceneCaptureComponent)
+    {
+        SceneCaptureComponent->SetWorldLocation(CameraLocation);
+        SceneCaptureComponent->SetWorldRotation(CameraRotation);
+        SceneCaptureComponent->OrthoWidth = OrthoWidth;
+        
+        SceneCaptureComponent->CaptureScene();
+    }
+}
+
 void UComputeShaderMeshSpawner::CreateBuffers()
 {
     if (NumInstances <= 0)
-    {
         return;
-    }
 
     const uint32 BufferSize = sizeof(FVector4f) * NumInstances;
     const uint32 BufferStride = sizeof(FVector4f);
@@ -52,8 +90,7 @@ void UComputeShaderMeshSpawner::CreateBuffers()
         [this, BufferStride, BufferSize](FRHICommandListImmediate& RHICmdList)
         {
             FRHIResourceCreateInfo CreateInfo(TEXT("SpawnPositionBuffer"));
-
-            // UE 5.5 proper API - CreateBuffer with descriptor
+            
             FBufferRHIRef TempBuffer = RHICmdList.CreateBuffer(
                 BufferSize,
                 BUF_UnorderedAccess | BUF_ShaderResource | BUF_StructuredBuffer,
@@ -61,16 +98,16 @@ void UComputeShaderMeshSpawner::CreateBuffers()
                 ERHIAccess::UAVCompute,
                 CreateInfo
             );
-
+            
             PositionBuffer = TempBuffer;
-
+            
             if (PositionBuffer.IsValid())
             {
                 PositionBufferUAV = RHICmdList.CreateUnorderedAccessView(PositionBuffer, false, false);
             }
         }
-        );
-
+    );
+    
     FlushRenderingCommands();
 }
 
@@ -82,42 +119,73 @@ void UComputeShaderMeshSpawner::ReleaseBuffers()
             PositionBufferUAV.SafeRelease();
             PositionBuffer.SafeRelease();
         }
-        );
-
+    );
+    
     FlushRenderingCommands();
 }
 
-void UComputeShaderMeshSpawner::RunComputeShader(float Time)
+void UComputeShaderMeshSpawner::RunComputeShader()
 {
-    if (!PositionBuffer.IsValid() || !PositionBufferUAV.IsValid())
-    {
-        UE_LOG(LogTemp, Warning, TEXT("ComputeShaderMeshSpawner: Buffers not valid"));
+    if (!PositionBuffer.IsValid() || !PositionBufferUAV.IsValid() || !DepthRenderTarget)
         return;
-    }
 
     FBufferRHIRef CapturedPositionBuffer = PositionBuffer;
     FUnorderedAccessViewRHIRef CapturedPositionBufferUAV = PositionBufferUAV;
-    float CapturedTime = Time;
-    float CapturedSpawnRadius = SpawnRadius;
+    FTextureRHIRef CapturedDepthTexture = DepthRenderTarget->GetResource()->TextureRHI;
+    
+    FRotationMatrix RotMatrix(CameraRotation);
+    FVector Forward = RotMatrix.GetScaledAxis(EAxis::X);
+    FVector Right = RotMatrix.GetScaledAxis(EAxis::Y);
+    FVector Up = RotMatrix.GetScaledAxis(EAxis::Z);
+    
+    FVector3f CapturedCameraPos = FVector3f(CameraLocation);
+    FVector3f CapturedCameraForward = FVector3f(Forward);
+    FVector3f CapturedCameraRight = FVector3f(Right);
+    FVector3f CapturedCameraUp = FVector3f(Up);
+    
+    float CapturedOrthoWidth = OrthoWidth;
+    float CapturedOrthoHeight = OrthoWidth;
     uint32 CapturedNumInstances = NumInstances;
+    float CapturedGridCellSize = GridCellSize;
+    float CapturedSpawnDensity = SpawnDensity;
+    float CapturedVerticalOffset = VerticalOffset;
+    float CapturedMaxRayDistance = MaxRayDistance;
+    float CapturedRaymarchStepSize = RaymarchStepSize;
+    uint32 CapturedMaxRaymarchSteps = MaxRaymarchSteps;
 
-    ENQUEUE_RENDER_COMMAND(ExecuteMyComputeShader)(
-        [CapturedPositionBuffer, CapturedPositionBufferUAV, CapturedTime, CapturedSpawnRadius, CapturedNumInstances]
-    (FRHICommandListImmediate& RHICmdList)
+    ENQUEUE_RENDER_COMMAND(ExecuteRaymarchingSpawn)(
+        [CapturedPositionBuffer, CapturedPositionBufferUAV, CapturedDepthTexture,
+         CapturedCameraPos, CapturedCameraForward, CapturedCameraRight, CapturedCameraUp,
+         CapturedOrthoWidth, CapturedOrthoHeight, CapturedNumInstances, CapturedGridCellSize,
+         CapturedSpawnDensity, CapturedVerticalOffset, CapturedMaxRayDistance,
+         CapturedRaymarchStepSize, CapturedMaxRaymarchSteps]
+        (FRHICommandListImmediate& RHICmdList)
         {
-            FRDGBuilder GraphBuilder(RHICmdList, RDG_EVENT_NAME("MeshSpawnCompute"));
+            FRDGBuilder GraphBuilder(RHICmdList, RDG_EVENT_NAME("RaymarchingFoliageSpawn"));
 
             FInstancesComputeShader::FParameters* Parameters = GraphBuilder.AllocParameters<FInstancesComputeShader::FParameters>();
             Parameters->SpawnPositions = CapturedPositionBufferUAV;
-            Parameters->Time = CapturedTime;
-            Parameters->SpawnRadius = CapturedSpawnRadius;
+            Parameters->SceneDepthTexture = CapturedDepthTexture;
+            Parameters->SceneDepthSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+            Parameters->CameraPosition = CapturedCameraPos;
+            Parameters->CameraForward = CapturedCameraForward;
+            Parameters->CameraRight = CapturedCameraRight;
+            Parameters->CameraUp = CapturedCameraUp;
+            Parameters->OrthoWidth = CapturedOrthoWidth;
+            Parameters->OrthoHeight = CapturedOrthoHeight;
             Parameters->NumInstances = CapturedNumInstances;
+            Parameters->GridCellSize = CapturedGridCellSize;
+            Parameters->SpawnDensity = CapturedSpawnDensity;
+            Parameters->VerticalOffset = CapturedVerticalOffset;
+            Parameters->MaxRayDistance = CapturedMaxRayDistance;
+            Parameters->RaymarchStepSize = CapturedRaymarchStepSize;
+            Parameters->MaxRaymarchSteps = CapturedMaxRaymarchSteps;
 
             TShaderMapRef<FInstancesComputeShader> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
 
             FComputeShaderUtils::AddPass(
                 GraphBuilder,
-                RDG_EVENT_NAME("MyMeshSpawnComputePass"),
+                RDG_EVENT_NAME("RaymarchingSpawnPass"),
                 ComputeShader,
                 Parameters,
                 FIntVector(FMath::DivideAndRoundUp((int32)CapturedNumInstances, 64), 1, 1)
@@ -125,7 +193,7 @@ void UComputeShaderMeshSpawner::RunComputeShader(float Time)
 
             GraphBuilder.Execute();
         }
-        );
+    );
 
     FlushRenderingCommands();
     UpdateMeshInstances();
@@ -134,16 +202,14 @@ void UComputeShaderMeshSpawner::RunComputeShader(float Time)
 void UComputeShaderMeshSpawner::UpdateMeshInstances()
 {
     if (!PositionBuffer.IsValid() || !InstancedMeshComponent)
-    {
         return;
-    }
 
     TArray<FVector4f> Positions;
     Positions.SetNum(NumInstances);
 
     FBufferRHIRef CapturedBuffer = PositionBuffer;
     int32 CapturedNumInstances = NumInstances;
-
+    
     ENQUEUE_RENDER_COMMAND(ReadBackPositions)(
         [CapturedBuffer, &Positions, CapturedNumInstances](FRHICommandListImmediate& RHICmdList)
         {
@@ -151,31 +217,30 @@ void UComputeShaderMeshSpawner::UpdateMeshInstances()
             FMemory::Memcpy(Positions.GetData(), BufferData, sizeof(FVector4f) * CapturedNumInstances);
             RHICmdList.UnlockBuffer(CapturedBuffer);
         }
-        );
-
+    );
+    
     FlushRenderingCommands();
 
     InstancedMeshComponent->ClearInstances();
 
     for (int32 i = 0; i < NumInstances; i++)
     {
+        if (Positions[i].Z < -50000.0f)
+            continue;
+
         FTransform Transform;
         Transform.SetLocation(FVector(Positions[i].X, Positions[i].Y, Positions[i].Z));
-        Transform.SetScale3D(FVector(1.0f));
-
+        Transform.SetScale3D(FVector(Positions[i].W));
+        
         InstancedMeshComponent->AddInstance(Transform, true);
     }
-
+    
     InstancedMeshComponent->MarkRenderStateDirty();
 }
 
 void UComputeShaderMeshSpawner::ExecuteComputeShader()
 {
-    if (GetWorld())
-    {
-        float Time = GetWorld()->GetTimeSeconds();
-        RunComputeShader(Time);
-    }
+    RunComputeShader();
 }
 
 void UComputeShaderMeshSpawner::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
@@ -184,6 +249,7 @@ void UComputeShaderMeshSpawner::TickComponent(float DeltaTime, ELevelTick TickTy
 
     if (bUpdateEveryFrame)
     {
+        CaptureDepth();
         ExecuteComputeShader();
     }
 }

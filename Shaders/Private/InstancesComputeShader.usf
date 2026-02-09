@@ -1,28 +1,107 @@
 #include "/Engine/Public/Platform.ush"
 
-// Input/Output buffers
 RWStructuredBuffer<float4> SpawnPositions;
-float Time;
-float SpawnRadius;
+Texture2D<float> SceneDepthTexture;
+SamplerState SceneDepthSampler;
+
+float3 CameraPosition;
+float3 CameraForward;
+float3 CameraRight;
+float3 CameraUp;
+float OrthoWidth;
+float OrthoHeight;
 uint NumInstances;
+float GridCellSize;
+float SpawnDensity;
+float VerticalOffset;
+float MaxRayDistance;
+float RaymarchStepSize;
+float MaxRaymarchSteps;
+
+float Hash2D(float2 p)
+{
+    return frac(sin(dot(p, float2(127.1, 311.7))) * 43758.5453123);
+}
 
 [numthreads(64, 1, 1)]
 void MainCS(uint3 ThreadId : SV_DispatchThreadID)
 {
-    float PI = 3.1415;
     uint Index = ThreadId.x;
-    SpawnPositions[Index] = float4(0.0, 0.0, 1000000.0, 1.0);
-    return;
+    
     if (Index >= NumInstances)
         return;
     
-    // Generate pseudo-random positions based on index and time
-    float Angle = (float)Index / (float)NumInstances * 2.0 * PI + Time;
-    float RadiusVariation = sin((float)Index * 0.1 + Time) * 0.5 + 0.5;
+    // Calculate grid position
+    uint GridWidth = (uint)sqrt((float)NumInstances);
+    uint GridHeight = GridWidth;
     
-    float X = cos(Angle) * SpawnRadius * RadiusVariation;
-    float Y = sin(Angle) * SpawnRadius * RadiusVariation;
-    float Z = sin((float)Index * 0.5 + Time) * 100.0;
+    uint GridX = Index % GridWidth;
+    uint GridY = Index / GridWidth;
     
-    SpawnPositions[Index] = float4(X, Y, Z, 1.0);
+    // Calculate base UV coordinates
+    float2 uv;
+    uv.x = ((float)GridX + 0.5) / (float)GridWidth;
+    uv.y = ((float)GridY + 0.5) / (float)GridHeight;
+    
+    // Apply jitter for randomization
+    float2 gridSeed = float2((float)GridX, (float)GridY);
+    float jitterX = (Hash2D(gridSeed) - 0.5) / (float)GridWidth;
+    float jitterY = (Hash2D(gridSeed + float2(42.0, 13.0)) - 0.5) / (float)GridHeight;
+    
+    uv.x += jitterX;
+    uv.y += jitterY;
+    uv = saturate(uv);
+    
+    // Sample depth directly from texture
+    float depth = SceneDepthTexture.SampleLevel(SceneDepthSampler, uv, 0);
+    
+    // Convert UV to NDC space
+    float2 ndc;
+    ndc.x = uv.x * 2.0 - 1.0;
+    ndc.y = (1.0 - uv.y) * 2.0 - 1.0;
+    
+    // Calculate world position directly using orthographic projection
+    float3 worldPosition = CameraPosition 
+                         + (ndc.x * OrthoWidth * 0.5 * CameraRight) 
+                         + (ndc.y * OrthoHeight * 0.5 * CameraUp)
+                         + (depth * CameraForward);
+    
+    // Check if we hit valid geometry (depth is within reasonable range)
+    bool didHit = (depth > 0.0 && depth < MaxRayDistance * 0.99);
+    
+    if (!didHit)
+    {
+        // No valid surface - place far away so it won't be rendered
+        worldPosition = float3(0, 0, -100000.0);
+    }
+    else
+    {
+        // Apply spawn probability
+        float spawnRandom = Hash2D(gridSeed + float2(100.0, 200.0));
+        bool shouldSpawn = spawnRandom < SpawnDensity;
+        
+        if (shouldSpawn)
+        {
+            // Add vertical offset
+            worldPosition += VerticalOffset * float3(0, 0, 1); // Assuming Z is up
+            
+            // Add random positional offset within grid cell
+            float offsetX = (Hash2D(gridSeed + float2(1.0, 2.0)) - 0.5) * GridCellSize;
+            float offsetY = (Hash2D(gridSeed + float2(3.0, 4.0)) - 0.5) * GridCellSize;
+            
+            worldPosition.x += offsetX;
+            worldPosition.y += offsetY;
+        }
+        else
+        {
+            // Spawn probability failed - hide this instance
+            worldPosition = float3(0, 0, -100000.0);
+        }
+    }
+    
+    // Calculate random scale variation
+    float scaleVariation = 0.7 + Hash2D(gridSeed + float2(7.0, 8.0)) * 0.6;
+    
+    // Write result
+    SpawnPositions[Index] = float4(worldPosition, scaleVariation);
 }

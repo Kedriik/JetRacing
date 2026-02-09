@@ -12,9 +12,21 @@ class FInstancesComputeShader : public FGlobalShader
 
     BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
         SHADER_PARAMETER_UAV(RWStructuredBuffer<FVector4f>, SpawnPositions)
-        SHADER_PARAMETER(float, Time)
-        SHADER_PARAMETER(float, SpawnRadius)
+        SHADER_PARAMETER_TEXTURE(Texture2D, SceneDepthTexture)
+        SHADER_PARAMETER_SAMPLER(SamplerState, SceneDepthSampler)
+        SHADER_PARAMETER(FVector3f, CameraPosition)
+        SHADER_PARAMETER(FVector3f, CameraForward)
+        SHADER_PARAMETER(FVector3f, CameraRight)
+        SHADER_PARAMETER(FVector3f, CameraUp)
+        SHADER_PARAMETER(float, OrthoWidth)
+        SHADER_PARAMETER(float, OrthoHeight)
         SHADER_PARAMETER(uint32, NumInstances)
+        SHADER_PARAMETER(float, GridCellSize)
+        SHADER_PARAMETER(float, SpawnDensity)
+        SHADER_PARAMETER(float, VerticalOffset)
+        SHADER_PARAMETER(float, MaxRayDistance)
+        SHADER_PARAMETER(float, RaymarchStepSize)
+        SHADER_PARAMETER(uint32, MaxRaymarchSteps)
     END_SHADER_PARAMETER_STRUCT()
 
 public:
