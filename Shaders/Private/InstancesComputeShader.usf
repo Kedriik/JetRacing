@@ -2,7 +2,9 @@
 
 RWStructuredBuffer<float4> SpawnPositions;
 Texture2D<float> SceneDepthTexture;
+Texture2D<float4> StencilTexture; // RGBA from post-process material
 SamplerState SceneDepthSampler;
+SamplerState StencilSampler;
 
 float3 CameraPosition;
 float3 CameraForward;
@@ -15,8 +17,7 @@ float GridCellSize;
 float SpawnDensity;
 float VerticalOffset;
 float MaxRayDistance;
-float RaymarchStepSize;
-float MaxRaymarchSteps;
+uint TargetStencilValue; // Stencil value to filter (e.g., 250)
 
 float Hash2D(float2 p)
 {
@@ -52,6 +53,13 @@ void MainCS(uint3 ThreadId : SV_DispatchThreadID)
     uv.y += jitterY;
     uv = saturate(uv);
     
+    // Sample stencil value (stored in R channel, normalized 0-1)
+    float4 stencilColor = StencilTexture.SampleLevel(StencilSampler, uv, 0);
+    uint stencilValue = (uint)(stencilColor.r * 255.0 + 0.5); // Convert back to 0-255 range
+    
+    // Check if this pixel belongs to our target mesh (voxel terrain)
+    bool isTargetMesh = (stencilValue == TargetStencilValue);
+    
     // Sample depth directly from texture
     float depth = SceneDepthTexture.SampleLevel(SceneDepthSampler, uv, 0);
     
@@ -66,12 +74,12 @@ void MainCS(uint3 ThreadId : SV_DispatchThreadID)
                          + (ndc.y * OrthoHeight * 0.5 * CameraUp)
                          + (depth * CameraForward);
     
-    // Check if we hit valid geometry (depth is within reasonable range)
-    bool didHit = (depth > 0.0 && depth < MaxRayDistance * 0.99);
+    // Check if we hit valid geometry AND it's the target mesh
+    bool didHit = isTargetMesh && (depth > 0.0 && depth < MaxRayDistance * 0.99);
     
     if (!didHit)
     {
-        // No valid surface - place far away so it won't be rendered
+        // No valid surface or wrong mesh - place far away
         worldPosition = float3(0, 0, -100000.0);
     }
     else
@@ -82,8 +90,8 @@ void MainCS(uint3 ThreadId : SV_DispatchThreadID)
         
         if (shouldSpawn)
         {
-            // Add vertical offset
-            worldPosition += VerticalOffset * float3(0, 0, 1); // Assuming Z is up
+            // Add vertical offset (adjust based on your up axis)
+            worldPosition += VerticalOffset * float3(0, 0, 1); // Z-up
             
             // Add random positional offset within grid cell
             float offsetX = (Hash2D(gridSeed + float2(1.0, 2.0)) - 0.5) * GridCellSize;
@@ -94,7 +102,6 @@ void MainCS(uint3 ThreadId : SV_DispatchThreadID)
         }
         else
         {
-            // Spawn probability failed - hide this instance
             worldPosition = float3(0, 0, -100000.0);
         }
     }

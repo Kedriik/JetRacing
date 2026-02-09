@@ -23,6 +23,9 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Capture")
     TObjectPtr<UTextureRenderTarget2D> DepthRenderTarget;
 
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Capture")
+    TObjectPtr<UTextureRenderTarget2D> StencilRenderTarget;
+
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawning")
     int32 NumInstances = 10000;
 
@@ -43,6 +46,9 @@ public:
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Capture")
     float OrthoWidth = 10000.0f;
+    
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Capture")
+    UMaterialInterface* StencilVisualizationMaterial;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Raymarching")
     float MaxRayDistance = 2000000.0f;
@@ -62,6 +68,9 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Spawning")
     void CaptureDepth();
 
+    UFUNCTION(BlueprintCallable, Category = "Spawning")
+    void CaptureStencil();
+
     virtual void BeginPlay() override;
     virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
@@ -72,6 +81,9 @@ private:
 
     UPROPERTY()
     TObjectPtr<USceneCaptureComponent2D> SceneCaptureComponent;
+
+    UPROPERTY()
+    TObjectPtr<USceneCaptureComponent2D> StencilCaptureComponent;
 
     FBufferRHIRef PositionBuffer;
     FUnorderedAccessViewRHIRef PositionBufferUAV;

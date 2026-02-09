@@ -14,6 +14,8 @@ class FInstancesComputeShader : public FGlobalShader
         SHADER_PARAMETER_UAV(RWStructuredBuffer<FVector4f>, SpawnPositions)
         SHADER_PARAMETER_TEXTURE(Texture2D, SceneDepthTexture)
         SHADER_PARAMETER_SAMPLER(SamplerState, SceneDepthSampler)
+        SHADER_PARAMETER_TEXTURE(Texture2D, StencilTexture)
+        SHADER_PARAMETER_SAMPLER(SamplerState, StencilSampler)
         SHADER_PARAMETER(FVector3f, CameraPosition)
         SHADER_PARAMETER(FVector3f, CameraForward)
         SHADER_PARAMETER(FVector3f, CameraRight)
@@ -27,6 +29,7 @@ class FInstancesComputeShader : public FGlobalShader
         SHADER_PARAMETER(float, MaxRayDistance)
         SHADER_PARAMETER(float, RaymarchStepSize)
         SHADER_PARAMETER(uint32, MaxRaymarchSteps)
+        SHADER_PARAMETER(uint32, TargetStencilValue)
     END_SHADER_PARAMETER_STRUCT()
 
 public:
