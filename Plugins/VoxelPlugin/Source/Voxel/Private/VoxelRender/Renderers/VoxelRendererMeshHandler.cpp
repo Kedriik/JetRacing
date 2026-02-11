@@ -266,6 +266,8 @@ UVoxelProceduralMeshComponent* IVoxelRendererMeshHandler::GetNewMesh(FChunkId Ch
 		if (!NewMesh)
 		{
 			NewMesh = NewObject<UVoxelProceduralMeshComponent>(RootComponent, Settings.ProcMeshClass, NAME_None, RF_Transient);
+			
+
 			NewMesh->SetupAttachment(RootComponent, NAME_None);
 			auto* Root = Cast<UPrimitiveComponent>(RootComponent);
 			if (ensure(Root))

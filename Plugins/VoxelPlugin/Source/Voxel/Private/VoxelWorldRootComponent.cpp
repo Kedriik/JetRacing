@@ -144,7 +144,7 @@ public:
 		Result.bDynamicRelevance = true;
 		Result.bRenderInMainPass = true;
 		Result.bUsesLightingChannels = false;
-		Result.bRenderCustomDepth = false;
+		Result.bRenderCustomDepth = true;
 		Result.bTranslucentSelfShadow = false;
 		Result.bVelocityRelevance = false;
 		return Result;

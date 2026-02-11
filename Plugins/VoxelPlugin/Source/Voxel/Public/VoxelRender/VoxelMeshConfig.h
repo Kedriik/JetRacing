@@ -20,7 +20,7 @@ struct FVoxelMeshConfig
 	
 	/** If true, this component will be rendered in the CustomDepth pass (usually used for outlines) */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Voxel", meta=(DisplayName = "Render CustomDepth Pass"))
-	bool bRenderCustomDepth = false;
+	bool bRenderCustomDepth = true;
 	
 	/** Mask used for stencil buffer writes. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Voxel", meta=(EditCondition="bRenderCustomDepth"))
@@ -28,7 +28,7 @@ struct FVoxelMeshConfig
 
 	/** Optionally write this 0-255 value to the stencil buffer in CustomDepth pass (Requires project setting or r.CustomDepth == 3) */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Voxel",  meta=(UIMin = "0", UIMax = "255", EditCondition="bRenderCustomDepth", DisplayName = "CustomDepth Stencil Value"))
-	int32 CustomDepthStencilValue = 0;
+	int32 CustomDepthStencilValue = 42;
 
 	template<typename T>
 	inline auto& ApplyTo(T& Mesh) const

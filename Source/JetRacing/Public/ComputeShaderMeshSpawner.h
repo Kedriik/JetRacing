@@ -30,6 +30,9 @@ public:
     int32 NumInstances = 10000;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawning")
+    int32 TargetStencilValue= 42;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawning")
     float GridCellSize = 50.0f;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawning", meta = (ClampMin = "0.0", ClampMax = "1.0"))

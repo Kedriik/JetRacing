@@ -170,11 +170,11 @@ struct VOXEL_API FVoxelPrimitiveComponentSettings
 
 	// If true, this component will be rendered in the CustomDepth pass (usually used for outlines)
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Rendering", meta = (DisplayName = "Render CustomDepth Pass"))
-	bool bRenderCustomDepth = false;
+	bool bRenderCustomDepth = true;
 
 	// Optionally write this 0-255 value to the stencil buffer in CustomDepth pass (Requires project setting or r.CustomDepth == 3)
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Rendering", meta = (UIMin = "0", UIMax = "255", EditCondition = "bRenderCustomDepth", DisplayName = "CustomDepth Stencil Value"))
-	int32 CustomDepthStencilValue = 0;
+	int32 CustomDepthStencilValue = 42;
 
 	// When true, will only be visible in Scene Capture
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Rendering", meta = (DisplayName = "Visible In Scene Capture Only"))

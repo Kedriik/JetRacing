@@ -600,7 +600,7 @@ FPrimitiveViewRelevance FVoxelProceduralMeshSceneProxy::GetViewRelevance(const F
 	Result.bDynamicRelevance = true;
 	Result.bRenderInMainPass = ShouldRenderInMainPass();
 	Result.bUsesLightingChannels = GetLightingChannelMask() != GetDefaultLightingChannelMask();
-	Result.bRenderCustomDepth = ShouldRenderCustomDepth();
+	Result.bRenderCustomDepth = true;//ShouldRenderCustomDepth();
 	Result.bTranslucentSelfShadow = bCastVolumetricTranslucentShadow;
 	MaterialRelevance.SetPrimitiveViewRelevance(Result);
 	Result.bVelocityRelevance = IsMovable() && Result.bOpaque && Result.bRenderInMainPass;
@@ -638,11 +638,12 @@ void FVoxelProceduralMeshSceneProxy::DrawSection(
 	const FMaterialRenderProxy* MaterialRenderProxy,
 	bool bEnableTessellation,
 	bool bWireframe) const
-{
+{	
 	VOXEL_RENDER_FUNCTION_COUNTER();
 	
 	check(MaterialRenderProxy);
 	check(Section.RenderData.IsValid());
+	
 
 	Mesh.VertexFactory = &Section.RenderData->VertexFactory;
 	Mesh.MaterialRenderProxy = MaterialRenderProxy;
@@ -661,6 +662,7 @@ void FVoxelProceduralMeshSceneProxy::DrawSection(
 	BatchElement.NumPrimitives = Section.Buffers->IndexBuffer.GetNumIndices() / 3;
 	BatchElement.MinVertexIndex = 0;
 	BatchElement.MaxVertexIndex = Section.Buffers->VertexBuffers.PositionVertexBuffer.GetNumVertices() - 1;
+
 
 #if ENABLE_TESSELLATION
 	if (bEnableTessellation)

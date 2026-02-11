@@ -55,7 +55,7 @@ void MainCS(uint3 ThreadId : SV_DispatchThreadID)
     
     // Sample stencil value (stored in R channel, normalized 0-1)
     float4 stencilColor = StencilTexture.SampleLevel(StencilSampler, uv, 0);
-    uint stencilValue = (uint)(stencilColor.r * 255.0 + 0.5); // Convert back to 0-255 range
+    float stencilValue = stencilColor.r;
     
     // Check if this pixel belongs to our target mesh (voxel terrain)
     bool isTargetMesh = (stencilValue == TargetStencilValue);

@@ -83,11 +83,11 @@ public:
 
 	/** If true, the foliage will be rendered in the CustomDepth pass (usually used for outlines) */
 	UPROPERTY(EditAnywhere, AdvancedDisplay, BlueprintReadWrite, Category = "Instance Settings", meta=(DisplayName = "Render CustomDepth Pass"))
-	bool bRenderCustomDepth = false;
+	bool bRenderCustomDepth = true;
 
 	/** Optionally write this 0-255 value to the stencil buffer in CustomDepth pass (Requires project setting or r.CustomDepth == 3) */
 	UPROPERTY(EditAnywhere, AdvancedDisplay, BlueprintReadWrite, Category = "Instance Settings",  meta=(UIMin = "0", UIMax = "255", editcondition = "bRenderCustomDepth", DisplayName = "CustomDepth Stencil Value"))
-	int32 CustomDepthStencilValue = 0;
+	int32 CustomDepthStencilValue = 42;
 
 	// If more instances are added before BuildDelay seconds elapsed, the tree build is queued
 	// This is useful to avoid spending lots of time building the tree for nothing.

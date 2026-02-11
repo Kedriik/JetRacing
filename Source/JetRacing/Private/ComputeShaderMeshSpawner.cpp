@@ -54,7 +54,7 @@ void UComputeShaderMeshSpawner::SetupDepthCapture()
     if (!StencilRenderTarget)
     {
         StencilRenderTarget = NewObject<UTextureRenderTarget2D>(this);
-        StencilRenderTarget->RenderTargetFormat = RTF_R8;
+        StencilRenderTarget->RenderTargetFormat = RTF_R32f;
         StencilRenderTarget->InitAutoFormat(2048, 2048);
         StencilRenderTarget->UpdateResourceImmediate(true);
     }
@@ -82,7 +82,7 @@ void UComputeShaderMeshSpawner::SetupDepthCapture()
 
     StencilCaptureComponent->TextureTarget = StencilRenderTarget;
     StencilCaptureComponent->CaptureSource = SCS_FinalColorLDR;
-    StencilCaptureComponent->bCaptureEveryFrame = false;
+    StencilCaptureComponent->bCaptureEveryFrame = true;
     StencilCaptureComponent->bCaptureOnMovement = false;
 
     // Apply stencil visualization material - CORRECTED METHOD
@@ -200,13 +200,14 @@ void UComputeShaderMeshSpawner::RunComputeShader()
     float CapturedMaxRayDistance = MaxRayDistance;
     float CapturedRaymarchStepSize = RaymarchStepSize;
     uint32 CapturedMaxRaymarchSteps = MaxRaymarchSteps;
+    uint32 CapturedTargetStencilValue = TargetStencilValue;
 
     ENQUEUE_RENDER_COMMAND(ExecuteRaymarchingSpawn)(
         [CapturedPositionBuffer, CapturedPositionBufferUAV, CapturedDepthTexture,
          CapturedCameraPos, CapturedCameraForward, CapturedCameraRight, CapturedCameraUp,
          CapturedOrthoWidth, CapturedOrthoHeight, CapturedNumInstances, CapturedGridCellSize,
          CapturedSpawnDensity, CapturedVerticalOffset, CapturedMaxRayDistance,
-         CapturedRaymarchStepSize, CapturedMaxRaymarchSteps,CapturedStencilTexture]
+         CapturedRaymarchStepSize, CapturedMaxRaymarchSteps,CapturedStencilTexture, CapturedTargetStencilValue]
         (FRHICommandListImmediate& RHICmdList)
         {
             FRDGBuilder GraphBuilder(RHICmdList, RDG_EVENT_NAME("RaymarchingFoliageSpawn"));
@@ -230,6 +231,7 @@ void UComputeShaderMeshSpawner::RunComputeShader()
             Parameters->MaxRayDistance = CapturedMaxRayDistance;
             Parameters->RaymarchStepSize = CapturedRaymarchStepSize;
             Parameters->MaxRaymarchSteps = CapturedMaxRaymarchSteps;
+            Parameters->TargetStencilValue = CapturedTargetStencilValue;
 
             TShaderMapRef<FInstancesComputeShader> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
 
@@ -300,6 +302,7 @@ void UComputeShaderMeshSpawner::TickComponent(float DeltaTime, ELevelTick TickTy
     if (bUpdateEveryFrame)
     {
         CaptureDepth();
+        CaptureStencil();
         ExecuteComputeShader();
     }
 }
