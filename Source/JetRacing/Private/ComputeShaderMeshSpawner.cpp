@@ -50,18 +50,13 @@ void UComputeShaderMeshSpawner::SetupDepthCapture()
         DepthRenderTarget->UpdateResourceImmediate(true);
     }
 
-     // Create stencil render target
-    if (!StencilRenderTarget)
-    {
-        StencilRenderTarget = NewObject<UTextureRenderTarget2D>(this);
-        StencilRenderTarget->RenderTargetFormat = RTF_R32f;
-        StencilRenderTarget->InitAutoFormat(2048, 2048);
-        StencilRenderTarget->UpdateResourceImmediate(true);
-    }
-    // Setup stencil depth capture
+   
+    // DEPTH CAPTURE COMPONENT
     SceneCaptureComponent = NewObject<USceneCaptureComponent2D>(GetOwner(), TEXT("DepthCaptureComp"));
     SceneCaptureComponent->RegisterComponent();
     SceneCaptureComponent->AttachToComponent(GetOwner()->GetRootComponent(), FAttachmentTransformRules::KeepRelativeTransform);
+
+    SceneCaptureComponent->PrimitiveRenderMode = ESceneCapturePrimitiveRenderMode::PRM_UseShowOnlyList;
     
     SceneCaptureComponent->TextureTarget = DepthRenderTarget;
     SceneCaptureComponent->CaptureSource = SCS_SceneDepth;
@@ -74,7 +69,12 @@ void UComputeShaderMeshSpawner::SetupDepthCapture()
     SceneCaptureComponent->ProjectionType = ECameraProjectionMode::Orthographic;
     SceneCaptureComponent->OrthoWidth = OrthoWidth;
 
-    // === STENCIL CAPTURE COMPONENT ===
+    /// STENCIL CAPTURE COMPOENNT
+    StencilRenderTarget = NewObject<UTextureRenderTarget2D>(this);
+    StencilRenderTarget->RenderTargetFormat = RTF_RGBA32f; // Changed to RGBA to hold stencil + depth
+    StencilRenderTarget->InitAutoFormat(2048, 2048);
+    StencilRenderTarget->UpdateResourceImmediate(true);
+
     StencilCaptureComponent = NewObject<USceneCaptureComponent2D>(GetOwner(), TEXT("StencilCaptureComp"));
     StencilCaptureComponent->RegisterComponent();
     StencilCaptureComponent->AttachToComponent(GetOwner()->GetRootComponent(),
@@ -82,10 +82,22 @@ void UComputeShaderMeshSpawner::SetupDepthCapture()
 
     StencilCaptureComponent->TextureTarget = StencilRenderTarget;
     StencilCaptureComponent->CaptureSource = SCS_FinalColorLDR;
-    StencilCaptureComponent->bCaptureEveryFrame = true;
+    StencilCaptureComponent->bCaptureEveryFrame = true; // Changed to false for performance
     StencilCaptureComponent->bCaptureOnMovement = false;
 
-    // Apply stencil visualization material - CORRECTED METHOD
+    // CRITICAL: Set this FIRST before anything else
+    StencilCaptureComponent->PrimitiveRenderMode = ESceneCapturePrimitiveRenderMode::PRM_UseShowOnlyList;
+
+    // Configure show flags to ONLY render what we need
+    StencilCaptureComponent->ShowFlags.SetAtmosphere(false);
+    StencilCaptureComponent->ShowFlags.SetFog(false);
+    StencilCaptureComponent->ShowFlags.SetVolumetricFog(false);
+    StencilCaptureComponent->ShowFlags.SetMotionBlur(false);
+    StencilCaptureComponent->ShowFlags.SetBloom(false);
+    StencilCaptureComponent->ShowFlags.SetAmbientOcclusion(false);
+    StencilCaptureComponent->ShowFlags.SetDynamicShadows(false);
+
+    // Apply stencil visualization material AFTER setting primitive mode
     if (StencilVisualizationMaterial)
     {
         StencilCaptureComponent->PostProcessSettings.WeightedBlendables.Array.Add(
@@ -103,6 +115,7 @@ void UComputeShaderMeshSpawner::SetupDepthCapture()
 
 void UComputeShaderMeshSpawner::CaptureDepth()
 {
+    UpdateVoxelComponentList();
     if (SceneCaptureComponent)
     {
         SceneCaptureComponent->SetWorldLocation(CameraLocation);
@@ -115,6 +128,7 @@ void UComputeShaderMeshSpawner::CaptureDepth()
 
 void UComputeShaderMeshSpawner::CaptureStencil()
 {
+    UpdateVoxelComponentList();
     if (StencilCaptureComponent)
     {
         StencilCaptureComponent->SetWorldLocation(CameraLocation);
@@ -173,8 +187,17 @@ void UComputeShaderMeshSpawner::ReleaseBuffers()
 
 void UComputeShaderMeshSpawner::RunComputeShader()
 {
-    if (!PositionBuffer.IsValid() || !PositionBufferUAV.IsValid() || !DepthRenderTarget || !StencilRenderTarget)
+
+    // === STENCIL CAPTURE COMPONENT ===
+    if (VoxelWorldActor && !StencilRenderTarget)
+    {
+        
+    }
+
+    if (!PositionBuffer.IsValid() || !PositionBufferUAV.IsValid() || !DepthRenderTarget || !StencilRenderTarget || !StencilRenderTarget->GetResource()->TextureRHI)
         return;
+
+
 
     FBufferRHIRef CapturedPositionBuffer = PositionBuffer;
     FUnorderedAccessViewRHIRef CapturedPositionBufferUAV = PositionBufferUAV;
@@ -302,7 +325,31 @@ void UComputeShaderMeshSpawner::TickComponent(float DeltaTime, ELevelTick TickTy
     if (bUpdateEveryFrame)
     {
         CaptureDepth();
-        CaptureStencil();
+       // CaptureStencil();
         ExecuteComputeShader();
     }
+}
+
+void UComputeShaderMeshSpawner::UpdateVoxelComponentList()
+{
+    if (!SceneCaptureComponent)
+        return;
+
+    SceneCaptureComponent->ShowOnlyComponents.Empty();
+
+    int32 ComponentCount = 0;
+
+    for (TObjectIterator<UPrimitiveComponent> It; It; ++It)
+    {
+        UPrimitiveComponent* Comp = *It;
+
+        if (Comp &&
+            Comp->GetWorld() == GetWorld() &&
+            Comp->ComponentHasTag(VoxelMeshComponentTag))
+        {
+            SceneCaptureComponent->ShowOnlyComponents.Add(Comp);
+            ComponentCount++;
+        }
+    }
+
 }

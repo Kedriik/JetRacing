@@ -58,7 +58,7 @@ void MainCS(uint3 ThreadId : SV_DispatchThreadID)
     float stencilValue = stencilColor.r;
     
     // Check if this pixel belongs to our target mesh (voxel terrain)
-    bool isTargetMesh = (stencilValue == TargetStencilValue);
+    bool isTargetMesh = true;//(stencilValue == TargetStencilValue);
     
     // Sample depth directly from texture
     float depth = SceneDepthTexture.SampleLevel(SceneDepthSampler, uv, 0);

@@ -7,6 +7,7 @@
 #include "Engine/TextureRenderTarget2D.h"
 #include "RHI.h"
 #include "RHIResources.h"
+#include "Components/PrimitiveComponent.h"
 #include "ComputeShaderMeshSpawner.generated.h"
 
 UCLASS(ClassGroup=(Custom), meta=(BlueprintSpawnableComponent))
@@ -53,6 +54,12 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Capture")
     UMaterialInterface* StencilVisualizationMaterial;
 
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Capture")
+    TObjectPtr<UPrimitiveComponent> VoxelWorldActor;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Capture")
+    FName VoxelMeshComponentTag = FName("VoxelMesh");
+
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Raymarching")
     float MaxRayDistance = 2000000.0f;
 
@@ -96,4 +103,5 @@ private:
     void RunComputeShader();
     void UpdateMeshInstances();
     void SetupDepthCapture();
+    void UpdateVoxelComponentList();
 };
