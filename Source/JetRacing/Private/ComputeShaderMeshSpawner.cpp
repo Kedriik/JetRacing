@@ -68,49 +68,7 @@ void UComputeShaderMeshSpawner::SetupDepthCapture()
     
     SceneCaptureComponent->ProjectionType = ECameraProjectionMode::Orthographic;
     SceneCaptureComponent->OrthoWidth = OrthoWidth;
-
-    /// STENCIL CAPTURE COMPOENNT
-    StencilRenderTarget = NewObject<UTextureRenderTarget2D>(this);
-    StencilRenderTarget->RenderTargetFormat = RTF_RGBA32f; // Changed to RGBA to hold stencil + depth
-    StencilRenderTarget->InitAutoFormat(2048, 2048);
-    StencilRenderTarget->UpdateResourceImmediate(true);
-
-    StencilCaptureComponent = NewObject<USceneCaptureComponent2D>(GetOwner(), TEXT("StencilCaptureComp"));
-    StencilCaptureComponent->RegisterComponent();
-    StencilCaptureComponent->AttachToComponent(GetOwner()->GetRootComponent(),
-        FAttachmentTransformRules::KeepRelativeTransform);
-
-    StencilCaptureComponent->TextureTarget = StencilRenderTarget;
-    StencilCaptureComponent->CaptureSource = SCS_FinalColorLDR;
-    StencilCaptureComponent->bCaptureEveryFrame = true; // Changed to false for performance
-    StencilCaptureComponent->bCaptureOnMovement = false;
-
-    // CRITICAL: Set this FIRST before anything else
-    StencilCaptureComponent->PrimitiveRenderMode = ESceneCapturePrimitiveRenderMode::PRM_UseShowOnlyList;
-
-    // Configure show flags to ONLY render what we need
-    StencilCaptureComponent->ShowFlags.SetAtmosphere(false);
-    StencilCaptureComponent->ShowFlags.SetFog(false);
-    StencilCaptureComponent->ShowFlags.SetVolumetricFog(false);
-    StencilCaptureComponent->ShowFlags.SetMotionBlur(false);
-    StencilCaptureComponent->ShowFlags.SetBloom(false);
-    StencilCaptureComponent->ShowFlags.SetAmbientOcclusion(false);
-    StencilCaptureComponent->ShowFlags.SetDynamicShadows(false);
-
-    // Apply stencil visualization material AFTER setting primitive mode
-    if (StencilVisualizationMaterial)
-    {
-        StencilCaptureComponent->PostProcessSettings.WeightedBlendables.Array.Add(
-            FWeightedBlendable(1.0f, StencilVisualizationMaterial)
-        );
-    }
-
-    StencilCaptureComponent->SetWorldLocation(CameraLocation);
-    StencilCaptureComponent->SetWorldRotation(CameraRotation);
-    StencilCaptureComponent->ProjectionType = ECameraProjectionMode::Orthographic;
-    StencilCaptureComponent->OrthoWidth = OrthoWidth;
-
-    UE_LOG(LogTemp, Log, TEXT("Depth capture setup complete"));
+    
 }
 
 void UComputeShaderMeshSpawner::CaptureDepth()
@@ -123,19 +81,6 @@ void UComputeShaderMeshSpawner::CaptureDepth()
         SceneCaptureComponent->OrthoWidth = OrthoWidth;
         
         SceneCaptureComponent->CaptureScene();
-    }
-}
-
-void UComputeShaderMeshSpawner::CaptureStencil()
-{
-    UpdateVoxelComponentList();
-    if (StencilCaptureComponent)
-    {
-        StencilCaptureComponent->SetWorldLocation(CameraLocation);
-        StencilCaptureComponent->SetWorldRotation(CameraRotation);
-        StencilCaptureComponent->OrthoWidth = OrthoWidth;
-        
-        StencilCaptureComponent->CaptureScene();
     }
 }
 
@@ -188,13 +133,7 @@ void UComputeShaderMeshSpawner::ReleaseBuffers()
 void UComputeShaderMeshSpawner::RunComputeShader()
 {
 
-    // === STENCIL CAPTURE COMPONENT ===
-    if (VoxelWorldActor && !StencilRenderTarget)
-    {
-        
-    }
-
-    if (!PositionBuffer.IsValid() || !PositionBufferUAV.IsValid() || !DepthRenderTarget || !StencilRenderTarget || !StencilRenderTarget->GetResource()->TextureRHI)
+    if (!PositionBuffer.IsValid() || !PositionBufferUAV.IsValid() || !DepthRenderTarget)
         return;
 
 
@@ -202,7 +141,6 @@ void UComputeShaderMeshSpawner::RunComputeShader()
     FBufferRHIRef CapturedPositionBuffer = PositionBuffer;
     FUnorderedAccessViewRHIRef CapturedPositionBufferUAV = PositionBufferUAV;
     FTextureRHIRef CapturedDepthTexture = DepthRenderTarget->GetResource()->TextureRHI;
-    FTextureRHIRef CapturedStencilTexture = StencilRenderTarget->GetResource()->TextureRHI;
     
     FRotationMatrix RotMatrix(CameraRotation);
     FVector Forward = RotMatrix.GetScaledAxis(EAxis::X);
@@ -220,17 +158,12 @@ void UComputeShaderMeshSpawner::RunComputeShader()
     float CapturedGridCellSize = GridCellSize;
     float CapturedSpawnDensity = SpawnDensity;
     float CapturedVerticalOffset = VerticalOffset;
-    float CapturedMaxRayDistance = MaxRayDistance;
-    float CapturedRaymarchStepSize = RaymarchStepSize;
-    uint32 CapturedMaxRaymarchSteps = MaxRaymarchSteps;
-    uint32 CapturedTargetStencilValue = TargetStencilValue;
 
     ENQUEUE_RENDER_COMMAND(ExecuteRaymarchingSpawn)(
         [CapturedPositionBuffer, CapturedPositionBufferUAV, CapturedDepthTexture,
          CapturedCameraPos, CapturedCameraForward, CapturedCameraRight, CapturedCameraUp,
          CapturedOrthoWidth, CapturedOrthoHeight, CapturedNumInstances, CapturedGridCellSize,
-         CapturedSpawnDensity, CapturedVerticalOffset, CapturedMaxRayDistance,
-         CapturedRaymarchStepSize, CapturedMaxRaymarchSteps,CapturedStencilTexture, CapturedTargetStencilValue]
+         CapturedSpawnDensity, CapturedVerticalOffset]
         (FRHICommandListImmediate& RHICmdList)
         {
             FRDGBuilder GraphBuilder(RHICmdList, RDG_EVENT_NAME("RaymarchingFoliageSpawn"));
@@ -239,8 +172,6 @@ void UComputeShaderMeshSpawner::RunComputeShader()
             Parameters->SpawnPositions = CapturedPositionBufferUAV;
             Parameters->SceneDepthTexture = CapturedDepthTexture;
             Parameters->SceneDepthSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
-            Parameters->StencilTexture = CapturedStencilTexture;
-            Parameters->StencilSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
             Parameters->CameraPosition = CapturedCameraPos;
             Parameters->CameraForward = CapturedCameraForward;
             Parameters->CameraRight = CapturedCameraRight;
@@ -251,10 +182,6 @@ void UComputeShaderMeshSpawner::RunComputeShader()
             Parameters->GridCellSize = CapturedGridCellSize;
             Parameters->SpawnDensity = CapturedSpawnDensity;
             Parameters->VerticalOffset = CapturedVerticalOffset;
-            Parameters->MaxRayDistance = CapturedMaxRayDistance;
-            Parameters->RaymarchStepSize = CapturedRaymarchStepSize;
-            Parameters->MaxRaymarchSteps = CapturedMaxRaymarchSteps;
-            Parameters->TargetStencilValue = CapturedTargetStencilValue;
 
             TShaderMapRef<FInstancesComputeShader> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
 
@@ -325,7 +252,6 @@ void UComputeShaderMeshSpawner::TickComponent(float DeltaTime, ELevelTick TickTy
     if (bUpdateEveryFrame)
     {
         CaptureDepth();
-       // CaptureStencil();
         ExecuteComputeShader();
     }
 }
