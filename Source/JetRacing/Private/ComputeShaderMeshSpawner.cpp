@@ -60,8 +60,40 @@ void UComputeShaderMeshSpawner::SetupDepthCapture()
     
     SceneCaptureComponent->TextureTarget = DepthRenderTarget;
     SceneCaptureComponent->CaptureSource = SCS_SceneDepth;
-    SceneCaptureComponent->bCaptureEveryFrame = true;
+    SceneCaptureComponent->bCaptureEveryFrame = false;
     SceneCaptureComponent->bCaptureOnMovement = false;
+
+    // CRITICAL: Disable ALL unnecessary rendering features
+   /* SceneCaptureComponent->ShowFlags.SetAntiAliasing(false);
+    SceneCaptureComponent->ShowFlags.SetAtmosphere(false);
+    SceneCaptureComponent->ShowFlags.SetFog(false);
+    SceneCaptureComponent->ShowFlags.SetVolumetricFog(false);
+    SceneCaptureComponent->ShowFlags.SetMotionBlur(false);
+    SceneCaptureComponent->ShowFlags.SetBloom(false);
+    SceneCaptureComponent->ShowFlags.SetAmbientOcclusion(false);
+    SceneCaptureComponent->ShowFlags.SetDynamicShadows(false);
+    SceneCaptureComponent->ShowFlags.SetContactShadows(false);
+    SceneCaptureComponent->ShowFlags.SetDirectionalLights(false);
+    SceneCaptureComponent->ShowFlags.SetPointLights(false);
+    SceneCaptureComponent->ShowFlags.SetSpotLights(false);
+    SceneCaptureComponent->ShowFlags.SetRectLights(false);
+    SceneCaptureComponent->ShowFlags.SetSkyLighting(false);
+    SceneCaptureComponent->ShowFlags.SetIndirectLightingCache(false);
+    SceneCaptureComponent->ShowFlags.SetReflectionEnvironment(false);
+    SceneCaptureComponent->ShowFlags.SetScreenSpaceReflections(false);
+    SceneCaptureComponent->ShowFlags.SetTexturedLightProfiles(false);
+    SceneCaptureComponent->ShowFlags.SetAmbientCubemap(false);
+    SceneCaptureComponent->ShowFlags.SetDistanceFieldAO(false);
+    SceneCaptureComponent->ShowFlags.SetLightFunctions(false);
+    SceneCaptureComponent->ShowFlags.SetLightShafts(false);
+    SceneCaptureComponent->ShowFlags.SetPostProcessing(false);
+    SceneCaptureComponent->ShowFlags.SetTranslucency(false);
+    SceneCaptureComponent->ShowFlags.SetScreenPercentage(false);
+    SceneCaptureComponent->ShowFlags.SetTemporalAA(false);
+    SceneCaptureComponent->ShowFlags.SetGlobalIllumination(false);
+    SceneCaptureComponent->ShowFlags.SetDiffuse(false);
+    SceneCaptureComponent->ShowFlags.SetSpecular(false);
+    */
     
     SceneCaptureComponent->SetWorldLocation(CameraLocation);
     SceneCaptureComponent->SetWorldRotation(CameraRotation);
@@ -73,15 +105,28 @@ void UComputeShaderMeshSpawner::SetupDepthCapture()
 
 void UComputeShaderMeshSpawner::CaptureDepth()
 {
-    UpdateVoxelComponentList();
-    if (SceneCaptureComponent)
-    {
-        SceneCaptureComponent->SetWorldLocation(CameraLocation);
-        SceneCaptureComponent->SetWorldRotation(CameraRotation);
-        SceneCaptureComponent->OrthoWidth = OrthoWidth;
-        
-        SceneCaptureComponent->CaptureScene();
-    }
+    if (bCaptureInProgress)
+        return; // Skip if previous capture still in progress
+
+    if (!SceneCaptureComponent)
+        return;
+
+    SceneCaptureComponent->ShowOnlyComponents.Remove(nullptr);
+    SceneCaptureComponent->SetWorldLocation(CameraLocation);
+    SceneCaptureComponent->SetWorldRotation(CameraRotation);
+    SceneCaptureComponent->OrthoWidth = OrthoWidth;
+
+    bCaptureInProgress = true;
+
+    // Capture async
+    AsyncTask(ENamedThreads::GameThread, [this]()
+        {
+            if (SceneCaptureComponent)
+            {
+                SceneCaptureComponent->CaptureScene();
+            }
+            bCaptureInProgress = false;
+        });
 }
 
 void UComputeShaderMeshSpawner::CreateBuffers()
@@ -185,13 +230,21 @@ void UComputeShaderMeshSpawner::RunComputeShader()
 
             TShaderMapRef<FInstancesComputeShader> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
 
+            FUintVector2 CapturedGridDimensions(8, 8);
+            FIntVector ThreadGroupCount(
+                10,
+                100,
+                1
+            );
+
             FComputeShaderUtils::AddPass(
                 GraphBuilder,
-                RDG_EVENT_NAME("RaymarchingSpawnPass"),
+                RDG_EVENT_NAME("ComputeSpawnPass"),
                 ComputeShader,
                 Parameters,
-                FIntVector(FMath::DivideAndRoundUp((int32)CapturedNumInstances, 64), 1, 1)
+                ThreadGroupCount
             );
+                
 
             GraphBuilder.Execute();
         }
@@ -224,20 +277,19 @@ void UComputeShaderMeshSpawner::UpdateMeshInstances()
     FlushRenderingCommands();
 
     InstancedMeshComponent->ClearInstances();
-
-    for (int32 i = 0; i < NumInstances; i++)
-    {
-        if (Positions[i].Z < -50000.0f)
-            continue;
-
-        FTransform Transform;
-        Transform.SetLocation(FVector(Positions[i].X, Positions[i].Y, Positions[i].Z));
-        Transform.SetScale3D(FVector(Positions[i].W));
-        
-        InstancedMeshComponent->AddInstance(Transform, true);
-    }
     
+    for (int32 i = 0; i < NumInstances; i++)
+        {
+            FTransform Transform;
+            Transform.SetLocation(FVector(Positions[i].X, Positions[i].Y, Positions[i].Z));
+            Transform.SetScale3D(FVector(Positions[i].W));
+
+            InstancedMeshComponent->AddInstance(Transform, true);
+    };
+    
+    // THIS IS THE KEY - properly trigger the update
     InstancedMeshComponent->MarkRenderStateDirty();
+    InstancedMeshComponent->MarkRenderTransformDirty();
 }
 
 void UComputeShaderMeshSpawner::ExecuteComputeShader()
@@ -278,4 +330,20 @@ void UComputeShaderMeshSpawner::UpdateVoxelComponentList()
         }
     }
 
+}
+
+void UComputeShaderMeshSpawner::RegisterVoxelMeshComponent(UPrimitiveComponent* Component)
+{
+    if (!SceneCaptureComponent && !Component)
+        return;
+    
+    SceneCaptureComponent->ShowOnlyComponents.Add(Component);
+}
+
+void UComputeShaderMeshSpawner::UnregisterVoxelMeshComponent(UPrimitiveComponent* Component)
+{
+    if (!SceneCaptureComponent && !Component)
+        return;
+
+    SceneCaptureComponent->ShowOnlyComponents.Remove(Component);
 }

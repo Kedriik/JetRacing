@@ -35,6 +35,7 @@ public:
     static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
     {
         FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
-        OutEnvironment.SetDefine(TEXT("THREADGROUP_SIZE"), 64);
+      //  OutEnvironment.SetDefine(TEXT("THREADGROUP_SIZE"), 64);
+        
     }
 };

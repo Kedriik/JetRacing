@@ -51,6 +51,12 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Capture")
     FName VoxelMeshComponentTag = FName("VoxelMesh");
 
+    UFUNCTION(BlueprintCallable, Category = "Spawning")
+    void RegisterVoxelMeshComponent(UPrimitiveComponent* Component);
+
+    UFUNCTION(BlueprintCallable, Category = "Spawning")
+    void UnregisterVoxelMeshComponent(UPrimitiveComponent* Component);
+
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawning")
     bool bUpdateEveryFrame = false;
 
@@ -73,6 +79,7 @@ private:
 
     FBufferRHIRef PositionBuffer;
     FUnorderedAccessViewRHIRef PositionBufferUAV;
+    bool bCaptureInProgress = false;
     
     void CreateBuffers();
     void ReleaseBuffers();

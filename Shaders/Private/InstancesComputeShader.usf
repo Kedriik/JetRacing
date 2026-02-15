@@ -20,10 +20,13 @@ float Hash2D(float2 p)
     return frac(sin(dot(p, float2(127.1, 311.7))) * 43758.5453123);
 }
 
-[numthreads(64, 1, 1)]
+[numthreads(10, 100, 1)]
 void MainCS(uint3 ThreadId : SV_DispatchThreadID)
 {
-    uint Index = ThreadId.x;
+    uint Width =10;
+    uint X = ThreadId.x; // Column
+    uint Y = ThreadId.y; // Row
+    uint Index = Y * Width + X;
     
     if (Index >= NumInstances)
         return;
@@ -69,7 +72,7 @@ void MainCS(uint3 ThreadId : SV_DispatchThreadID)
     if (!didHit)
     {
         // No valid surface or wrong mesh - place far away
-        worldPosition = float3(0, 0, -100000.0);
+        worldPosition = float3(0, 0, 0);
     }
     else
     {
@@ -91,7 +94,7 @@ void MainCS(uint3 ThreadId : SV_DispatchThreadID)
         }
         else
         {
-            worldPosition = float3(0, 0, -100000.0);
+            worldPosition = float3(0, 0, 0);
         }
     }
     
