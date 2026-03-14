@@ -1,0 +1,8 @@
+{
+	"BuildId": "4a5c67e1-693b-49bf-8c22-e7838343688e",
+	"Modules": 
+	{
+		"IndirectInstancing": "UnrealEditor-IndirectInstancing.dll",
+		"ShadeupExamplePlugin": "UnrealEditor-ShadeupExamplePlugin.dll"
+	}
+}

@@ -1,0 +1,14 @@
+{
+    "Version": "1.2",
+    "Data": {
+        "Source": "c:\\users\\kedriik\\documents\\unreal projects\\jetracing\\plugins\\indirectinstancing_plugin\\intermediate\\build\\win64\\x64\\unrealeditor\\development\\shadeupexampleplugin\\permoduleinline.gen.cpp",
+        "ProvidedModule": "",
+        "PCH": "f:\\ue5.5.3\\engine\\intermediate\\build\\win64\\x64\\unrealeditor\\development\\unrealed\\sharedpch.unrealed.project.valapi.cpp20.h.pch",
+        "Includes": [
+            "c:\\users\\kedriik\\documents\\unreal projects\\jetracing\\plugins\\indirectinstancing_plugin\\intermediate\\build\\win64\\x64\\unrealeditor\\development\\shadeupexampleplugin\\definitions.shadeupexampleplugin.h",
+            "f:\\ue5.5.3\\engine\\source\\runtime\\core\\public\\hal\\permoduleinline.inl"
+        ],
+        "ImportedModules": [],
+        "ImportedHeaderUnits": []
+    }
+}

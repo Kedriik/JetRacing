@@ -1,0 +1,38 @@
+{
+    "Version": "1.2",
+    "Data": {
+        "Source": "c:\\users\\kedriik\\documents\\unreal projects\\jetracing\\plugins\\indirectinstancing_plugin\\source\\indirectinstancing\\private\\indirectinstancing.cpp",
+        "ProvidedModule": "",
+        "PCH": "f:\\ue5.5.3\\engine\\intermediate\\build\\win64\\x64\\unrealeditor\\development\\unrealed\\sharedpch.unrealed.project.valapi.cpp20.h.pch",
+        "Includes": [
+            "c:\\users\\kedriik\\documents\\unreal projects\\jetracing\\plugins\\indirectinstancing_plugin\\intermediate\\build\\win64\\x64\\unrealeditor\\development\\indirectinstancing\\definitions.indirectinstancing.h",
+            "c:\\users\\kedriik\\documents\\unreal projects\\jetracing\\plugins\\indirectinstancing_plugin\\source\\indirectinstancing\\public\\indirectinstancing.h",
+            "f:\\ue5.5.3\\engine\\source\\runtime\\rendercore\\public\\rendergraphbuilder.h",
+            "f:\\ue5.5.3\\engine\\source\\runtime\\rendercore\\public\\rendergraphblackboard.h",
+            "f:\\ue5.5.3\\engine\\source\\runtime\\core\\public\\misc\\generatedtypename.h",
+            "f:\\ue5.5.3\\engine\\source\\runtime\\rendercore\\public\\rendergraphevent.h",
+            "f:\\ue5.5.3\\engine\\source\\runtime\\rendercore\\public\\rendergraphevent.inl",
+            "f:\\ue5.5.3\\engine\\source\\runtime\\rendercore\\public\\rendergraphpass.h",
+            "f:\\ue5.5.3\\engine\\source\\runtime\\rendercore\\public\\rendergraphparameter.h",
+            "f:\\ue5.5.3\\engine\\source\\runtime\\rendercore\\public\\rendergraphresources.h",
+            "f:\\ue5.5.3\\engine\\source\\runtime\\rhi\\public\\rhitransientresourceallocator.h",
+            "f:\\ue5.5.3\\engine\\source\\runtime\\rendercore\\public\\rendergraphresources.inl",
+            "f:\\ue5.5.3\\engine\\source\\runtime\\rendercore\\public\\rendergraphparameters.inl",
+            "f:\\ue5.5.3\\engine\\source\\runtime\\rendercore\\public\\rendergraphtrace.h",
+            "f:\\ue5.5.3\\engine\\source\\runtime\\rendercore\\public\\rendergraphvalidation.h",
+            "f:\\ue5.5.3\\engine\\source\\runtime\\core\\public\\experimental\\containers\\robinhoodhashtable.h",
+            "f:\\ue5.5.3\\engine\\source\\runtime\\rendercore\\public\\rendergraphbuilder.inl",
+            "f:\\ue5.5.3\\engine\\source\\runtime\\rendercore\\public\\rendertargetpool.h",
+            "f:\\ue5.5.3\\engine\\source\\runtime\\projects\\public\\interfaces\\ipluginmanager.h",
+            "f:\\ue5.5.3\\engine\\source\\runtime\\projects\\public\\plugindescriptor.h",
+            "f:\\ue5.5.3\\engine\\source\\runtime\\projects\\public\\custombuildsteps.h",
+            "f:\\ue5.5.3\\engine\\source\\runtime\\projects\\public\\localizationdescriptor.h",
+            "f:\\ue5.5.3\\engine\\source\\runtime\\projects\\public\\moduledescriptor.h",
+            "f:\\ue5.5.3\\engine\\source\\runtime\\projects\\public\\plugindisalloweddescriptor.h",
+            "f:\\ue5.5.3\\engine\\source\\runtime\\projects\\public\\pluginreferencedescriptor.h",
+            "f:\\ue5.5.3\\engine\\source\\runtime\\projects\\public\\versescope.h"
+        ],
+        "ImportedModules": [],
+        "ImportedHeaderUnits": []
+    }
+}
