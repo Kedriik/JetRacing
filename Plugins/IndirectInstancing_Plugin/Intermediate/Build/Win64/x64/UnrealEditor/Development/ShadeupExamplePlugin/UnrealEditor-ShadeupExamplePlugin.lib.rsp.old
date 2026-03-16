@@ -6,8 +6,8 @@
 /NAME:"UnrealEditor-ShadeupExamplePlugin.dll"
 /IGNORE:4221
 /NODEFAULTLIB
-"F:\JetRacing\Intermediate\Build\Win64\x64\JetRacingEditor\Development\UnrealEd\SharedPCH.UnrealEd.Project.ValApi.Cpp20.h.obj"
-"F:\JetRacing\Plugins\DisabledPlugin\IndirectInstancing_Plugin\Intermediate\Build\Win64\x64\UnrealEditor\Development\ShadeupExamplePlugin\ShadeupExamplePlugin.cpp.obj"
-"F:\JetRacing\Plugins\DisabledPlugin\IndirectInstancing_Plugin\Intermediate\Build\Win64\x64\UnrealEditor\Development\ShadeupExamplePlugin\PerModuleInline.gen.cpp.obj"
-"F:\JetRacing\Plugins\DisabledPlugin\IndirectInstancing_Plugin\Intermediate\Build\Win64\x64\UnrealEditor\Development\ShadeupExamplePlugin\Default.rc2.res"
-/OUT:"F:\JetRacing\Plugins\DisabledPlugin\IndirectInstancing_Plugin\Intermediate\Build\Win64\x64\UnrealEditor\Development\ShadeupExamplePlugin\UnrealEditor-ShadeupExamplePlugin.lib"
+"..\Intermediate\Build\Win64\x64\UnrealEditor\Development\UnrealEd\SharedPCH.UnrealEd.Project.ValApi.Cpp20.h.obj"
+"C:\Users\Kedriik\Documents\Unreal Projects\JetRacing\Plugins\IndirectInstancing_Plugin\Intermediate\Build\Win64\x64\UnrealEditor\Development\ShadeupExamplePlugin\ShadeupExamplePlugin.cpp.obj"
+"C:\Users\Kedriik\Documents\Unreal Projects\JetRacing\Plugins\IndirectInstancing_Plugin\Intermediate\Build\Win64\x64\UnrealEditor\Development\ShadeupExamplePlugin\PerModuleInline.gen.cpp.obj"
+"..\Intermediate\Build\Win64\x64\UnrealEditor\Development\Default.rc2.res"
+/OUT:"C:\Users\Kedriik\Documents\Unreal Projects\JetRacing\Plugins\IndirectInstancing_Plugin\Intermediate\Build\Win64\x64\UnrealEditor\Development\ShadeupExamplePlugin\UnrealEditor-ShadeupExamplePlugin.lib"

@@ -5,9 +5,11 @@
 
 #include "CoreMinimal.h"
 #include "Components/PrimitiveComponent.h"
+#include "Engine/StaticMesh.h"
 #include "ExampleIndirectInstancingComponent.generated.h"
 
 class UMaterialInterface;
+class UStaticMesh;
 
 UCLASS(Blueprintable, ClassGroup = Rendering, hideCategories = (Activation, Collision, Cooking, HLOD, Navigation, Object, Physics, VirtualTexture))
 class INDIRECTINSTANCING_API UExampleIndirectInstancingComponent : public UPrimitiveComponent
@@ -20,6 +22,16 @@ protected:
 	UMaterialInterface* Material = nullptr;
 
 public:
+	/** Static mesh to render via indirect instancing. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Rendering)
+	UStaticMesh* Mesh = nullptr;
+
+	/**
+	 * World-space transforms for each instance.
+	 * Leave empty to render a single instance at the component's own transform.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Instancing)
+	TArray<FTransform> InstanceTransforms;
 
 	UMaterialInterface* GetMaterial() const { return Material; }
 

@@ -5,9 +5,18 @@
 #include "/Engine/Private/VirtualTextureCommon.ush"
 #include "ExampleIndirectInstancing.ush"
 
-StructuredBuffer<QuadRenderInstance> InstanceBuffer;
+// Per-instance transforms written by CullInstancesCS each frame.
+StructuredBuffer<MeshRenderInstance> InstanceBuffer;
 float3 LodViewOrigin;
-// float4 LodDistances;
+
+// Static-mesh vertex streams — fetched manually using SV_VertexID.
+// MeshPositionBuffer : float x 3 per vertex (xyz packed as consecutive floats)
+// MeshTangentBuffer  : float4 x 2 per vertex (even = TangentX, odd = TangentZ, SNORM8x4 decoded to float4)
+// MeshUVBuffer       : float2 per UV slot; all channels interleaved, so UV0 is at VId * MeshNumTexCoords
+Buffer<float>  MeshPositionBuffer;
+Buffer<float4> MeshTangentBuffer;
+Buffer<float2> MeshUVBuffer;
+uint           MeshNumTexCoords; // number of UV channels, used to index into interleaved UV buffer
 
 /** Per-vertex inputs. No vertex buffers are bound. */
 struct FVertexFactoryInput
@@ -20,10 +29,12 @@ struct FVertexFactoryInput
 struct FVertexFactoryIntermediates
 {
 	float2 LocalUV;
-	float3 LocalPos;
+	float3 LocalPos;     // position in mesh-local space
+	float3 LocalTangentX;
+	float3 LocalNormal;  // TangentZ
 	float3 WorldNormal;
 	/** Cached primitive and instance data */
-	FSceneDataIntermediates SceneData; 
+	FSceneDataIntermediates SceneData;
 };
 
 FPrimitiveSceneData GetPrimitiveData(FVertexFactoryIntermediates Intermediates)
@@ -42,37 +53,63 @@ struct FVertexFactoryInterpolantsVSToPS
 #endif
 };
 
+/**
+ * Reconstruct the 4x4 instance-to-world matrix from a MeshRenderInstance.
+ * Storage layout: Row0 = (m00, m01, m02, tx), Row1 = (m10, m11, m12, ty), Row2 = (m20, m21, m22, tz).
+ * For HLSL mul(float4(pos,1), M) (vector on left), M must be row-major with translation in column 3.
+ * float4x4 constructor takes rows, so:
+ *   Row 0 = (m00, m01, m02, tx)
+ *   Row 1 = (m10, m11, m12, ty)
+ *   Row 2 = (m20, m21, m22, tz)
+ *   Row 3 = (0,   0,   0,   1 )
+ */
+float4x4 GetInstanceToWorldMatrix(MeshRenderInstance Inst)
+{
+	return float4x4(
+		Inst.InstanceToWorld0,               // row 0
+		Inst.InstanceToWorld1,               // row 1
+		Inst.InstanceToWorld2,               // row 2
+		float4(0.0f, 0.0f, 0.0f, 1.0f)      // row 3
+	);
+}
+
 /** Compute the intermediates for a given vertex. */
 FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput Input)
 {
 	FVertexFactoryIntermediates Intermediates;
 	Intermediates.SceneData = VF_GPUSCENE_GET_INTERMEDIATES(Input);
 
-	const QuadRenderInstance Item = InstanceBuffer[Input.InstanceId];
-	uint2 VertexCoord = uint2(Input.VertexId % 2, Input.VertexId / 2);
-	const uint2 Pos = VertexCoord * 1000.f;
-	const uint Level = 0; //UnpackLevel(Item);
-	
-	
-	const float3 LocalUVTransform = float3(0.0f, 0.0f, 0.0f);
+	// -----------------------------------------------------------------------
+	// 1. Fetch real vertex attributes from manual-fetch streams.
+	// -----------------------------------------------------------------------
+	uint VId = Input.VertexId;
 
-	float2 LocalUV = (float2)VertexCoord / (float)(2 - 1);
+	// Position: three consecutive floats per vertex.
+	Intermediates.LocalPos = float3(
+		MeshPositionBuffer[VId * 3 + 0],
+		MeshPositionBuffer[VId * 3 + 1],
+		MeshPositionBuffer[VId * 3 + 2]);
 
-	// Calculate vertex UV details before morphing
-	float2 XY = ((float2)Pos + LocalUV) * (float)(1u << Level);
-	float2 NormalizedPos = (XY * 1.f);
-	float SampleLevel = Level;
+	// Tangents: even slot = TangentX, odd slot = TangentZ.
+	// Stored as SNORM float4 in [-1,1] (already decoded by the SRV format).
+	float4 TangentX4 = MeshTangentBuffer[VId * 2 + 0];
+	float4 TangentZ4 = MeshTangentBuffer[VId * 2 + 1];
+	Intermediates.LocalTangentX = TangentX4.xyz;
+	Intermediates.LocalNormal   = TangentZ4.xyz;
 
-	// Position in space of virtual texture volume
-	// Intermediates.VTPos = float3(0, 0, 0);
+	// UV channel 0 — all channels are interleaved so stride by MeshNumTexCoords.
+	Intermediates.LocalUV = MeshUVBuffer[VId * MeshNumTexCoords + 0];
 
-	// Position in local space
-	Intermediates.LocalPos = float3(Pos, Input.InstanceId * 100.f);//mul(float4(Intermediates.VTPos, 1), VHM.VirtualHeightfieldToLocal).xyz;
-	Intermediates.LocalPos /= ((float) (Level + 1));
-	
-	Intermediates.LocalUV = NormalizedPos;
+	// -----------------------------------------------------------------------
+	// 2. Apply per-instance transform.
+	// -----------------------------------------------------------------------
+	MeshRenderInstance Inst = InstanceBuffer[Input.InstanceId];
+	float4x4 InstToWorld = GetInstanceToWorldMatrix(Inst);
 
-	Intermediates.WorldNormal = float3(0, 0, 1);
+	// Transform position and normal into instance world space.
+	// The result is still treated as "local" by the primitive's LocalToWorld below.
+	Intermediates.LocalPos   = mul(float4(Intermediates.LocalPos, 1.0f), InstToWorld).xyz;
+	Intermediates.WorldNormal = normalize(mul(float4(Intermediates.LocalNormal, 0.0f), InstToWorld).xyz);
 
 	return Intermediates;
 }
@@ -85,12 +122,10 @@ FMaterialVertexParameters GetMaterialVertexParameters(FVertexFactoryInput Input,
 	Result.SceneData = Intermediates.SceneData;
 	Result.WorldPosition = WorldPosition;
 
-	// needs fixing!
-	// Result.TangentToWorld = mul(TangentToLocal, (float3x3)VHM.VirtualHeightfieldToWorld);
 	Result.TangentToWorld[2] = Intermediates.WorldNormal;
 
-	Result.PreSkinnedPosition = WorldPosition;// Intermediates.WorldPosPreDisplacement.xyz;
-	Result.PreSkinnedNormal = float3(0, 0, 1);
+	Result.PreSkinnedPosition = WorldPosition;
+	Result.PreSkinnedNormal   = Intermediates.WorldNormal;
 
 #if NUM_MATERIAL_TEXCOORDS_VERTEX
 	UNROLL
@@ -98,7 +133,7 @@ FMaterialVertexParameters GetMaterialVertexParameters(FVertexFactoryInput Input,
 	{
 		Result.TexCoords[CoordinateIndex] = Intermediates.LocalUV;
 	}
-#endif  //NUM_MATERIAL_TEXCOORDS_VERTEX
+#endif
 
 	return Result;
 }
@@ -185,10 +220,13 @@ float3 VertexFactoryGetWorldNormal(FVertexFactoryInput Input, FVertexFactoryInte
 	return Intermediates.WorldNormal;
 }
 
-/** Get the 3x3 tangent basis vectors for this vertex factory. This vertex factory will calculate the binormal on-the-fly. */
+/** Get the 3x3 tangent basis vectors for this vertex factory. */
 half3x3 VertexFactoryGetTangentToLocal(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
 {
-	return half3x3(1, 0, 0, 0, 1, 0, 0, 0, 1);
+	float3 TangentX = normalize(Intermediates.LocalTangentX);
+	float3 TangentZ = normalize(Intermediates.LocalNormal);
+	float3 TangentY = cross(TangentZ, TangentX);
+	return half3x3(TangentX, TangentY, TangentZ);
 }
 
 /** Get the translated bounding sphere for this primitive. */

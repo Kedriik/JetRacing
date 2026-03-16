@@ -18,8 +18,12 @@ Buffer<uint2> QuadBuffer;
 RWBuffer<uint> RWIndirectArgsBuffer;
 Buffer<uint> IndirectArgsBufferSRV;
 
-RWStructuredBuffer<QuadRenderInstance> RWInstanceBuffer;
-StructuredBuffer<QuadRenderInstance> InstanceBuffer;
+// Output: surviving per-instance transforms (written by CullInstancesCS).
+RWStructuredBuffer<MeshRenderInstance> RWInstanceBuffer;
+
+// Input: full list of instances uploaded from CPU each frame.
+StructuredBuffer<MeshRenderInstance> SourceInstanceBuffer;
+uint NumSourceInstances;
 
 RWBuffer<uint> RWFeedbackBuffer;
 
@@ -181,38 +185,51 @@ void CollectQuadsCS(
 }
 
 /**
- * Initialise the indirect args for the final culled indirect draw call.
+ * Initialise the indirect args for the final DrawIndexedInstancedIndirect call.
+ * Layout matches D3D DrawIndexedInstancedIndirect / VkDrawIndexedIndirectCommand:
+ *   [0] IndexCountPerInstance  (set to real mesh LOD index count)
+ *   [1] InstanceCount          (incremented atomically by CullInstancesCS)
+ *   [2] StartIndexLocation
+ *   [3] BaseVertexLocation
+ *   [4] StartInstanceLocation
  */
-
 [numthreads(1, 1, 1)]
 void InitInstanceBufferCS()
 {
-	RWIndirectArgsBuffer[0] = NumIndices;
-	RWIndirectArgsBuffer[1] = 0; // Increment this counter during CullInstancesCS.
+	RWIndirectArgsBuffer[0] = (uint)NumIndices; // real mesh index count
+	RWIndirectArgsBuffer[1] = 0;               // InstanceCount — filled by CullInstancesCS
 	RWIndirectArgsBuffer[2] = 0;
 	RWIndirectArgsBuffer[3] = 0;
 	RWIndirectArgsBuffer[4] = 0;
 }
 
 /**
- * Cull the potentially visible render items for a view and generate the final buffer of instances to render.
+ * Frustum-cull every source instance and write surviving ones into RWInstanceBuffer.
+ * One thread per source instance.
+ *
+ * We use the translation column of the 3x4 instance-to-world matrix as the
+ * instance world origin, then test a conservative sphere against the 5 planes.
  */
-
 [numthreads(64, 1, 1)]
 void CullInstancesCS( uint3 DispatchThreadId : SV_DispatchThreadID )
 {
-	uint QuadIndex = DispatchThreadId.x;
-	if (QuadIndex >= IndirectArgsBufferSRV[3])
+	uint InstanceIndex = DispatchThreadId.x;
+	if (InstanceIndex >= NumSourceInstances)
 		return;
 
-	uint2 PackedItem = QuadBuffer[QuadIndex];
-	QuadRenderItem Item = UnpackQuadRenderItem(PackedItem);
-	
-	// Add to final render intance list.
-	QuadRenderInstance OutInstance;
-	OutInstance.UVTransform = float3(0, 0, 0);
-	OutInstance.PosLevelPacked = 0;
-	uint Write;
-	InterlockedAdd(RWIndirectArgsBuffer[1], 1, Write);
-	RWInstanceBuffer[Write] = OutInstance;
+	MeshRenderInstance Inst = SourceInstanceBuffer[InstanceIndex];
+
+	// Translation is stored in the .w component of each row.
+	float3 WorldOrigin = float3(Inst.InstanceToWorld0.w, Inst.InstanceToWorld1.w, Inst.InstanceToWorld2.w);
+
+	// Conservative sphere radius — replace with a real per-mesh bound if available.
+	float3 Extent = float3(200.0f, 200.0f, 200.0f);
+	bool bVisible = PlaneTestAABB(FrustumPlanes, WorldOrigin, Extent);
+
+	if (bVisible)
+	{
+		uint WriteSlot;
+		InterlockedAdd(RWIndirectArgsBuffer[1], 1, WriteSlot);
+		RWInstanceBuffer[WriteSlot] = Inst;
+	}
 }

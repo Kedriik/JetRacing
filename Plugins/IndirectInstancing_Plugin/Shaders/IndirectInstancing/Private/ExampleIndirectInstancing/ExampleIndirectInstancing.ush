@@ -90,6 +90,19 @@ struct QuadRenderInstance
 	uint PosLevelPacked;
 };
 
+/**
+ * Per-instance world transform stored as three float4 rows of a 3x4 row-major matrix.
+ * Row layout: (m00,m01,m02, tx), (m10,m11,m12, ty), (m20,m21,m22, tz).
+ * The fourth row is implicitly (0,0,0,1).
+ * Written by CullInstancesCS, read by the vertex factory.
+ */
+struct MeshRenderInstance
+{
+	float4 InstanceToWorld0;
+	float4 InstanceToWorld1;
+	float4 InstanceToWorld2;
+};
+
 uint2 UnpackPos(QuadRenderInstance Item)
 {
 	return uint2(Item.PosLevelPacked & 0x00000FFF, (Item.PosLevelPacked & 0x00FFF000) >> 12);

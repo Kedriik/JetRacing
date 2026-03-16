@@ -6,6 +6,7 @@
 #include "CoreMinimal.h"
 #include "PrimitiveSceneProxy.h"
 #include "Materials/MaterialRenderProxy.h"
+#include "StaticMeshResources.h"
 
 namespace ExampleIndirectInstancingMesh
 {
@@ -35,9 +36,6 @@ protected:
 	virtual void CreateRenderThreadResources(FRHICommandListBase& RHICmdList) override;
 	virtual void DestroyRenderThreadResources() override;
 	virtual void OnTransformChanged(FRHICommandListBase& RHICmdList) override;
-	// virtual bool HasSubprimitiveOcclusionQueries() const override;
-	// virtual const TArray<FBoxSphereBounds>* GetOcclusionQueries(const FSceneView* View) const override;
-	// virtual void AcceptOcclusionResults(const FSceneView* View, TArray<bool>* Results, int32 ResultsStart, int32 NumResults) override;
 	virtual FPrimitiveViewRelevance GetViewRelevance(const FSceneView *View) const override;
 	virtual void GetDynamicMeshElements(const TArray<const FSceneView *> &Views, const FSceneViewFamily &ViewFamily, uint32 VisibilityMap, FMeshElementCollector &Collector) const override;
 	//~ End FPrimitiveSceneProxy Interface
@@ -54,6 +52,28 @@ public:
 	bool bCallbackRegistered;
 
 	class FExampleIndirectInstancingVertexFactory *VertexFactory;
-};
 
-//  Notes: Looks like GetMeshShaderMap is returning nullptr during the DepthPass
+	// -----------------------------------------------------------------------
+	// Static mesh data — captured from LOD 0 at proxy construction time.
+	// -----------------------------------------------------------------------
+	const FStaticMeshVertexBuffers* MeshVertexBuffers = nullptr; // not owned
+	const FRawStaticIndexBuffer*    MeshIndexBuffer   = nullptr; // not owned
+	int32                           MeshNumIndices    = 0;
+	uint32                          MeshNumTexCoords  = 1;
+
+	// -----------------------------------------------------------------------
+	// Per-instance transform data.
+	// CPU side: built from UExampleIndirectInstancingComponent::InstanceTransforms.
+	// GPU side: uploaded once to SourceInstanceBuffer during CreateRenderThreadResources.
+	// -----------------------------------------------------------------------
+	struct FInstanceTransform
+	{
+		FVector4f Row0; // (m00,m01,m02, tx)
+		FVector4f Row1; // (m10,m11,m12, ty)
+		FVector4f Row2; // (m20,m21,m22, tz)
+	};
+	TArray<FInstanceTransform> CpuInstanceData;
+
+	FBufferRHIRef             SourceInstanceBuffer;
+	FShaderResourceViewRHIRef SourceInstanceBufferSRV;
+};

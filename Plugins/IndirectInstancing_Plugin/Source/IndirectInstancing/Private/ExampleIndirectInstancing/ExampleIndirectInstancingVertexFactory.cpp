@@ -13,6 +13,7 @@
 #include "MaterialDomain.h"
 #include "MeshDrawShaderBindings.h"
 #include "ShaderParameterUtils.h"
+#include "StaticMeshResources.h"
 
 IMPLEMENT_GLOBAL_SHADER_PARAMETER_STRUCT(FExampleIndirectInstancingParameters, "ExampleIndirectInstancingParams");
 
@@ -56,10 +57,12 @@ class FExampleIndirectInstancingShaderParameters : public FVertexFactoryShaderPa
 public:
 	void Bind(const FShaderParameterMap &ParameterMap)
 	{
-		// TODO
-		InstanceBufferParameter.Bind(ParameterMap, TEXT("InstanceBuffer"));
-		LodViewOriginParameter.Bind(ParameterMap, TEXT("LodViewOrigin"));
-		// LodDistancesParameter.Bind(ParameterMap, TEXT("LodDistances"));
+		InstanceBufferParameter.Bind(ParameterMap,     TEXT("InstanceBuffer"));
+		MeshPositionBufferParameter.Bind(ParameterMap, TEXT("MeshPositionBuffer"));
+		MeshTangentBufferParameter.Bind(ParameterMap,  TEXT("MeshTangentBuffer"));
+		MeshUVBufferParameter.Bind(ParameterMap,       TEXT("MeshUVBuffer"));
+		MeshNumTexCoordsParameter.Bind(ParameterMap,   TEXT("MeshNumTexCoords"));
+		LodViewOriginParameter.Bind(ParameterMap,      TEXT("LodViewOrigin"));
 	}
 
 	void GetElementShaderBindings(
@@ -77,17 +80,21 @@ public:
 		ShaderBindings.Add(Shader->GetUniformBufferParameter<FExampleIndirectInstancingParameters>(), VertexFactory->UniformBuffer);
 
 		FExampleIndirectInstancingUserData *UserData = (FExampleIndirectInstancingUserData *)BatchElement.UserData;
-		// TODO
-		ShaderBindings.Add(InstanceBufferParameter, UserData->InstanceBufferSRV);
-		ShaderBindings.Add(LodViewOriginParameter, UserData->LodViewOrigin);
-		// ShaderBindings.Add(LodDistancesParameter, UserData->LodDistances);
+		ShaderBindings.Add(InstanceBufferParameter,     UserData->InstanceBufferSRV);
+		ShaderBindings.Add(MeshPositionBufferParameter, UserData->PositionBufferSRV);
+		ShaderBindings.Add(MeshTangentBufferParameter,  UserData->TangentBufferSRV);
+		ShaderBindings.Add(MeshUVBufferParameter,       UserData->UV0BufferSRV);
+		ShaderBindings.Add(MeshNumTexCoordsParameter,   UserData->NumTexCoords);
+		ShaderBindings.Add(LodViewOriginParameter,      UserData->LodViewOrigin);
 	}
 
 protected:
-	// TODO
 	LAYOUT_FIELD(FShaderResourceParameter, InstanceBufferParameter);
-	LAYOUT_FIELD(FShaderParameter, LodViewOriginParameter);
-	// LAYOUT_FIELD(FShaderParameter, LodDistancesParameter);
+	LAYOUT_FIELD(FShaderResourceParameter, MeshPositionBufferParameter);
+	LAYOUT_FIELD(FShaderResourceParameter, MeshTangentBufferParameter);
+	LAYOUT_FIELD(FShaderResourceParameter, MeshUVBufferParameter);
+	LAYOUT_FIELD(FShaderParameter,         MeshNumTexCoordsParameter);
+	LAYOUT_FIELD(FShaderParameter,         LodViewOriginParameter);
 };
 
 IMPLEMENT_TYPE_LAYOUT(FExampleIndirectInstancingShaderParameters);
@@ -106,29 +113,67 @@ FExampleIndirectInstancingVertexFactory::~FExampleIndirectInstancingVertexFactor
 	delete IndexBuffer;
 }
 
+void FExampleIndirectInstancingVertexFactory::SetMeshBuffers(const FStaticMeshVertexBuffers* InVertexBuffers, const FIndexBuffer* InIndexBuffer)
+{
+	MeshVertexBuffers = InVertexBuffers;
+	MeshIndexBuffer   = InIndexBuffer;
+}
+
 void FExampleIndirectInstancingVertexFactory::InitRHI(FRHICommandListBase &RHICmdList)
 {
 	UniformBuffer = FExampleIndirectInstancingBufferRef::CreateUniformBufferImmediate(Params, UniformBuffer_MultiFrame);
 
+	// Keep the fallback index buffer for the case where no mesh is set.
 	IndexBuffer->InitResource(RHICmdList);
 
 	FVertexStream NullVertexStream;
-	NullVertexStream.VertexBuffer = nullptr;
-	NullVertexStream.Stride = 0;
-	NullVertexStream.Offset = 0;
-	NullVertexStream.VertexStreamUsage = EVertexStreamUsage::ManualFetch;
+	NullVertexStream.VertexBuffer        = nullptr;
+	NullVertexStream.Stride              = 0;
+	NullVertexStream.Offset              = 0;
+	NullVertexStream.VertexStreamUsage   = EVertexStreamUsage::ManualFetch;
 
 	check(Streams.Num() == 0);
 	Streams.Add(NullVertexStream);
 
 	FVertexDeclarationElementList Elements;
-
 	InitDeclaration(Elements);
+
+	// Build SRVs for the three manual-fetch vertex streams.
+	if (MeshVertexBuffers)
+	{
+		// Position: one float per element, shader fetches 3 consecutive → PF_R32_FLOAT
+		PositionBufferSRV = RHICmdList.CreateShaderResourceView(
+			MeshVertexBuffers->PositionVertexBuffer.VertexBufferRHI,
+			sizeof(float), PF_R32_FLOAT);
+
+		// Tangents: FPackedNormal (SNORM8x4) x2 per vertex (TangentX then TangentZ)
+		TangentBufferSRV = RHICmdList.CreateShaderResourceView(
+			MeshVertexBuffers->StaticMeshVertexBuffer.TangentsVertexBuffer.VertexBufferRHI,
+			sizeof(FPackedNormal), PF_R8G8B8A8_SNORM);
+
+		// UVs: may be half or full precision depending on the mesh import settings.
+		const bool bUseFullPrecisionUVs = MeshVertexBuffers->StaticMeshVertexBuffer.GetUseFullPrecisionUVs();
+		if (bUseFullPrecisionUVs)
+		{
+			UV0BufferSRV = RHICmdList.CreateShaderResourceView(
+				MeshVertexBuffers->StaticMeshVertexBuffer.TexCoordVertexBuffer.VertexBufferRHI,
+				sizeof(FVector2f), PF_G32R32F);
+		}
+		else
+		{
+			UV0BufferSRV = RHICmdList.CreateShaderResourceView(
+				MeshVertexBuffers->StaticMeshVertexBuffer.TexCoordVertexBuffer.VertexBufferRHI,
+				sizeof(FVector2DHalf), PF_G16R16F);
+		}
+	}
 }
 
 void FExampleIndirectInstancingVertexFactory::ReleaseRHI()
 {
 	UniformBuffer.SafeRelease();
+	PositionBufferSRV.SafeRelease();
+	TangentBufferSRV.SafeRelease();
+	UV0BufferSRV.SafeRelease();
 
 	if (IndexBuffer)
 	{

@@ -52,11 +52,27 @@ bool UExampleIndirectInstancingComponent::IsVisible() const
 
 FBoxSphereBounds UExampleIndirectInstancingComponent::CalcBounds(const FTransform& LocalToWorld) const
 {
+	// If we have explicit instance transforms, union their positions with a generous mesh-size radius.
+	if (InstanceTransforms.Num() > 0)
+	{
+		FBox InstanceBounds(ForceInit);
+		for (const FTransform& T : InstanceTransforms)
+		{
+			InstanceBounds += T.GetTranslation();
+		}
+		InstanceBounds = InstanceBounds.ExpandBy(FVector(10000.f));
+		return FBoxSphereBounds(InstanceBounds);
+	}
+
 	return FBoxSphereBounds(FBox(FVector(0.f, 0.f, 0.f), FVector(10000.f))).TransformBy(LocalToWorld);
 }
 
 FPrimitiveSceneProxy* UExampleIndirectInstancingComponent::CreateSceneProxy()
 {
+	if (Mesh == nullptr || Mesh->GetRenderData() == nullptr || Mesh->GetRenderData()->LODResources.Num() == 0)
+	{
+		return nullptr;
+	}
 	return new FExampleIndirectInstancingSceneProxy(this);
 }
 

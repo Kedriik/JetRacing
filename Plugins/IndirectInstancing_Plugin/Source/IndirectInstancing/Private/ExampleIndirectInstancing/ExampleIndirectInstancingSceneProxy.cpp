@@ -277,15 +277,55 @@ FExampleIndirectInstancingSceneProxy::FExampleIndirectInstancingSceneProxy(UExam
 {
 	ExampleIndirectInstancingRendererExtension.RegisterExtension();
 
-	// They have some LOD, but considered static as the LODs (are intended to) represent the same static surface.
-	// TODO Check if this allows WPO
 	bHasDeformableMesh = false;
 
 	UMaterialInterface *ComponentMaterial = InComponent->GetMaterial();
-	// TODO MATUSAGE
 	const bool bValidMaterial = ComponentMaterial != nullptr && ComponentMaterial->CheckMaterialUsage_Concurrent(MATUSAGE_VirtualHeightfieldMesh);
 	Material = bValidMaterial ? ComponentMaterial->GetRenderProxy() : UMaterial::GetDefaultMaterial(MD_Surface)->GetRenderProxy();
 	MaterialRelevance = Material->GetMaterialInterface()->GetRelevance_Concurrent(GetScene().GetFeatureLevel());
+
+	// Capture LOD 0 render data from the static mesh.
+	UStaticMesh* StaticMesh = InComponent->Mesh;
+	if (StaticMesh && StaticMesh->GetRenderData() && StaticMesh->GetRenderData()->LODResources.Num() > 0)
+	{
+		FStaticMeshLODResources& LOD = StaticMesh->GetRenderData()->LODResources[0];
+		MeshVertexBuffers = &LOD.VertexBuffers;
+		MeshIndexBuffer   = &LOD.IndexBuffer;
+		MeshNumIndices    = LOD.IndexBuffer.GetNumIndices();
+		MeshNumTexCoords  = LOD.VertexBuffers.StaticMeshVertexBuffer.GetNumTexCoords();
+	}
+
+	// Build CPU instance list from the component's InstanceTransforms array.
+	// Fall back to a single identity instance at the component's own transform.
+	auto MakeRow = [](const FTransform& T) -> FInstanceTransform
+	{
+		// FMatrix is row-major: M[row][col]. M[3][0..2] holds the translation.
+		// The HLSL shader does: mul(float4(LocalPos, 1), InstToWorld)
+		// where InstToWorld is constructed as float4x4(Row0, Row1, Row2, (0,0,0,1)).
+		// With HLSL row_major semantics, this means Row0 = matrix row 0, etc.
+		// So we store each row of the 4x4 directly, with translation in M[3][0..2]
+		// packed into the .w of each row.
+		const FMatrix44f M(T.ToMatrixWithScale());
+		FInstanceTransform Out;
+		Out.Row0 = FVector4f(M.M[0][0], M.M[0][1], M.M[0][2], M.M[3][0]); // row 0 + tx
+		Out.Row1 = FVector4f(M.M[1][0], M.M[1][1], M.M[1][2], M.M[3][1]); // row 1 + ty
+		Out.Row2 = FVector4f(M.M[2][0], M.M[2][1], M.M[2][2], M.M[3][2]); // row 2 + tz
+		return Out;
+	};
+
+	if (InComponent->InstanceTransforms.Num() > 0)
+	{
+		CpuInstanceData.Reserve(InComponent->InstanceTransforms.Num());
+		for (const FTransform& T : InComponent->InstanceTransforms)
+		{
+			CpuInstanceData.Add(MakeRow(T));
+		}
+	}
+	else
+	{
+		// Single instance at the component's world transform.
+		CpuInstanceData.Add(MakeRow(InComponent->GetComponentTransform()));
+	}
 }
 
 SIZE_T FExampleIndirectInstancingSceneProxy::GetTypeHash() const
@@ -312,21 +352,35 @@ void FExampleIndirectInstancingSceneProxy::OnTransformChanged(FRHICommandListBas
 
 void FExampleIndirectInstancingSceneProxy::CreateRenderThreadResources(FRHICommandListBase& RHICmdList)
 {
-	// UE5.6
-	// Always call the base implementation
 	FPrimitiveSceneProxy::CreateRenderThreadResources(RHICmdList);
 
-	// Gather vertex factory uniform parameters.
 	FExampleIndirectInstancingParameters UniformParams;
-	// TODO UNIFORM INIT
 
-	// Create vertex factory.
 	VertexFactory = new FExampleIndirectInstancingVertexFactory(GetScene().GetFeatureLevel(), UniformParams);
 
-	// UE5.6
-	// VertexFactory->InitResource(FRHICommandListImmediate::Get());
-	// ✅ Use the command list given by the engine, NOT FRHICommandListImmediate::Get()
+	// Supply mesh LOD buffers before init so InitRHI can build the SRVs.
+	if (MeshVertexBuffers && MeshIndexBuffer)
+	{
+		VertexFactory->SetMeshBuffers(MeshVertexBuffers, MeshIndexBuffer);
+	}
+
 	VertexFactory->InitResource(RHICmdList);
+
+	// Upload the CPU instance list to a GPU structured buffer read by CullInstancesCS.
+	if (CpuInstanceData.Num() > 0)
+	{
+		const uint32 Stride     = sizeof(FInstanceTransform);
+		const uint32 BufferSize = CpuInstanceData.Num() * Stride;
+
+		TResourceArray<FInstanceTransform, VERTEXBUFFER_ALIGNMENT> ResourceArray;
+		ResourceArray.Append(CpuInstanceData);
+
+		FRHIResourceCreateInfo CreateInfo(TEXT("ExampleIndirectInstancing.SourceInstanceBuffer"), &ResourceArray);
+		SourceInstanceBuffer = RHICmdList.CreateStructuredBuffer(
+			Stride, BufferSize,
+			BUF_ShaderResource, ERHIAccess::SRVMask, CreateInfo);
+		SourceInstanceBufferSRV = RHICmdList.CreateShaderResourceView(SourceInstanceBuffer);
+	}
 }
 
 void FExampleIndirectInstancingSceneProxy::DestroyRenderThreadResources()
@@ -337,6 +391,9 @@ void FExampleIndirectInstancingSceneProxy::DestroyRenderThreadResources()
 		delete VertexFactory;
 		VertexFactory = nullptr;
 	}
+
+	SourceInstanceBufferSRV.SafeRelease();
+	SourceInstanceBuffer.SafeRelease();
 }
 
 FPrimitiveViewRelevance FExampleIndirectInstancingSceneProxy::GetViewRelevance(const FSceneView *View) const
@@ -360,16 +417,16 @@ FPrimitiveViewRelevance FExampleIndirectInstancingSceneProxy::GetViewRelevance(c
 
 void FExampleIndirectInstancingSceneProxy::GetDynamicMeshElements(const TArray<const FSceneView *> &Views, const FSceneViewFamily &ViewFamily, uint32 VisibilityMap, FMeshElementCollector &Collector) const
 {
-	// MY CHANGES
 	check(IsInRenderingThread() || IsInParallelRenderingThread());
+
+	// Nothing to render if no mesh or no instances were captured.
+	if (!MeshIndexBuffer || MeshNumIndices == 0 || !SourceInstanceBufferSRV)
+	{
+		return;
+	}
 
 	if (ExampleIndirectInstancingRendererExtension.IsInFrame())
 	{
-		// Can't add new work while bInFrame.
-		// In UE5 we need to AddWork()/SubmitWork() in two phases: InitViews() and InitViewsAfterPrepass()
-		// The main renderer hooks for that don't exist in UE5.0 and are only added in UE5.1
-		// That means that for UE5.0 we always hit this for shadow drawing and shadows will not be rendered.
-		// Not earlying out here can lead to crashes from buffers being released too soon.
 		return;
 	}
 
@@ -377,7 +434,6 @@ void FExampleIndirectInstancingSceneProxy::GetDynamicMeshElements(const TArray<c
 	{
 		if (VisibilityMap & (1 << ViewIndex))
 		{
-			// TODO INIT instance buffer
 			const ExampleIndirectInstancingMesh::FDrawInstanceBuffers Buffers = ExampleIndirectInstancingRendererExtension.AddWork(this, ViewFamily.Views[0], Views[ViewIndex]);
 			if (!Buffers.InstanceBufferSRV || !Buffers.IndirectArgsBuffer)
 			{
@@ -401,29 +457,35 @@ void FExampleIndirectInstancingSceneProxy::GetDynamicMeshElements(const TArray<c
 			{
 				FMeshBatchElement &BatchElement = Mesh.Elements[0];
 
-				// TODO allow for non indirect instanced rendering
-				BatchElement.IndexBuffer = VertexFactory->GetIndexBuffer();
+				// Use the real static mesh index buffer instead of the dummy 3-index buffer.
+				BatchElement.IndexBuffer        = MeshIndexBuffer;
 				BatchElement.IndirectArgsBuffer = Buffers.IndirectArgsBuffer;
 				BatchElement.IndirectArgsOffset = 0;
 
-				BatchElement.FirstIndex = 0;
-				BatchElement.NumPrimitives = 0;
-				BatchElement.MinVertexIndex = 0;
-				BatchElement.MaxVertexIndex = 0;
+				BatchElement.FirstIndex      = 0;
+				BatchElement.NumPrimitives   = 0; // ignored when IndirectArgsBuffer is set
+				BatchElement.MinVertexIndex  = 0;
+				BatchElement.MaxVertexIndex  = 0;
 
-				BatchElement.PrimitiveIdMode = PrimID_ForceZero;
+				BatchElement.PrimitiveIdMode        = PrimID_ForceZero;
 				BatchElement.PrimitiveUniformBuffer = GetUniformBuffer();
 
 				FExampleIndirectInstancingUserData *UserData = &Collector.AllocateOneFrameResource<FExampleIndirectInstancingUserData>();
 				BatchElement.UserData = (void *)UserData;
 
+				// Culled instance transforms (written by CullInstancesCS this frame).
 				UserData->InstanceBufferSRV = Buffers.InstanceBufferSRV;
 
+				// Static-mesh vertex stream SRVs built in InitRHI.
+				UserData->PositionBufferSRV = VertexFactory->PositionBufferSRV.GetReference();
+				UserData->TangentBufferSRV  = VertexFactory->TangentBufferSRV.GetReference();
+				UserData->UV0BufferSRV      = VertexFactory->UV0BufferSRV.GetReference();
+				UserData->NumTexCoords      = MeshNumTexCoords;
+
 				FSceneView const *MainView = ViewFamily.Views[0];
-				UserData->LodViewOrigin = (FVector3f)MainView->ViewMatrices.GetViewOrigin(); // LWC_TODO: Precision Loss
+				UserData->LodViewOrigin = (FVector3f)MainView->ViewMatrices.GetViewOrigin();
 
 #if !(UE_BUILD_SHIPPING || UE_BUILD_TEST)
-				// Support the freezerendering mode. Use any frozen view state for culling.
 				const FViewMatrices *FrozenViewMatrices = MainView->State != nullptr ? MainView->State->GetFrozenViewMatrices() : nullptr;
 				if (FrozenViewMatrices != nullptr)
 				{
@@ -463,7 +525,7 @@ namespace ExampleIndirectInstancingMesh
 {
 	/* Keep indirect args offsets in sync with ISM.usf. */
 	static const int32 IndirectArgsByteOffset_FinalCull = 0;
-	static const int32 IndirectArgsByteSize = 4 * sizeof(uint32);
+	static const int32 IndirectArgsByteSize = 5 * sizeof(uint32); // DrawIndexedInstancedIndirect needs 5 uints
 
 	/** Shader structure used for tracking work queues in persistent wave style shaders. Keep in sync with ISM.ush. */
 	struct WorkerQueueInfo
@@ -475,7 +537,9 @@ namespace ExampleIndirectInstancingMesh
 
 	struct FExampleIndirectInstancingRenderInstance
 	{
-		float Position[3];
+		FVector4f Row0; // (m00,m01,m02, tx)
+		FVector4f Row1; // (m10,m11,m12, ty)
+		FVector4f Row2; // (m20,m21,m22, tz)
 	};
 
 	/** Compute shader to initialize all buffers, including adding the lowest mip page(s) to the QuadBuffer. */
@@ -591,6 +655,8 @@ namespace ExampleIndirectInstancingMesh
 		SHADER_PARAMETER(uint32, NumPhysicalAddressBits)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint2>, QuadBuffer)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, IndirectArgsBufferSRV)
+		SHADER_PARAMETER_SRV(StructuredBuffer<ExampleIndirectInstancingMesh::FExampleIndirectInstancingRenderInstance>, SourceInstanceBuffer)
+		SHADER_PARAMETER(uint32, NumSourceInstances)
 		SHADER_PARAMETER_UAV(RWStructuredBuffer<ExampleIndirectInstancingMesh::FExampleIndirectInstancingRenderInstance>, RWInstanceBuffer)
 		SHADER_PARAMETER_UAV(RWBuffer<uint>, RWIndirectArgsBuffer)
 		RDG_BUFFER_ACCESS(IndirectArgsBuffer, ERHIAccess::IndirectArgs)
@@ -884,13 +950,13 @@ namespace ExampleIndirectInstancingMesh
 				ComputeShader, PassParameters, FIntVector(InDesc.NumCollectPassWavefronts, 1, 1));
 	}
 
-	/** Initialise the draw indirect buffer. */
-	void AddPass_InitInstanceBuffer(FRDGBuilder & GraphBuilder, FGlobalShaderMap * InGlobalShaderMap, FDrawInstanceBuffers & InOutputResources)
+	/** Initialise the draw indirect buffer with the real mesh index count. */
+	void AddPass_InitInstanceBuffer(FRDGBuilder & GraphBuilder, FGlobalShaderMap * InGlobalShaderMap, FDrawInstanceBuffers & InOutputResources, int32 InNumIndices)
 	{
 		TShaderMapRef<FInitInstanceBufferVHM_CS> ComputeShader(InGlobalShaderMap);
 
 		FInitInstanceBufferVHM_CS::FParameters *PassParameters = GraphBuilder.AllocParameters<FInitInstanceBufferVHM_CS::FParameters>();
-		PassParameters->NumIndices = 3;
+		PassParameters->NumIndices = InNumIndices;
 		PassParameters->RWIndirectArgsBuffer = InOutputResources.IndirectArgsBufferUAV;
 
 		FComputeShaderUtils::AddPass(
@@ -899,29 +965,45 @@ namespace ExampleIndirectInstancingMesh
 				ComputeShader, PassParameters, FIntVector(1, 1, 1));
 	}
 
-	/** Cull quads and write to the final output buffer. */
-	void AddPass_CullInstances(FRDGBuilder & GraphBuilder, FGlobalShaderMap * InGlobalShaderMap, FProxyDesc const &InDesc, FVolatileResources &InVolatileResources, FDrawInstanceBuffers &InOutputResources, FChildViewDesc const &InViewDesc)
+	/** Cull source instances for a view and write survivors to the output buffer. */
+	void AddPass_CullInstances(FRDGBuilder & GraphBuilder, FGlobalShaderMap * InGlobalShaderMap, FProxyDesc const &InDesc, FVolatileResources &InVolatileResources, FDrawInstanceBuffers &InOutputResources, FChildViewDesc const &InViewDesc, FRHIShaderResourceView* InSourceInstanceBufferSRV, uint32 InNumSourceInstances)
 	{
 		FCullInstancesVHM_CS::FParameters *PassParameters = GraphBuilder.AllocParameters<FCullInstancesVHM_CS::FParameters>();
-		
-		PassParameters->QuadBuffer = InVolatileResources.QuadBufferSRV;
-		PassParameters->IndirectArgsBuffer = InVolatileResources.IndirectArgsBuffer;
-		PassParameters->IndirectArgsBufferSRV = InVolatileResources.IndirectArgsBufferSRV;
-		PassParameters->RWInstanceBuffer = InOutputResources.InstanceBufferUAV;
-		PassParameters->RWIndirectArgsBuffer = InOutputResources.IndirectArgsBufferUAV;
 
-		int32 IndirectArgOffset = ExampleIndirectInstancingMesh::IndirectArgsByteOffset_FinalCull;
+		PassParameters->QuadBuffer            = InVolatileResources.QuadBufferSRV;
+		PassParameters->IndirectArgsBuffer    = InVolatileResources.IndirectArgsBuffer;
+		PassParameters->IndirectArgsBufferSRV = InVolatileResources.IndirectArgsBufferSRV;
+		PassParameters->SourceInstanceBuffer  = InSourceInstanceBufferSRV;
+		PassParameters->NumSourceInstances    = InNumSourceInstances;
+		PassParameters->RWInstanceBuffer      = InOutputResources.InstanceBufferUAV;
+		PassParameters->RWIndirectArgsBuffer  = InOutputResources.IndirectArgsBufferUAV;
+
+		for (int32 PlaneIndex = 0; PlaneIndex < 5; ++PlaneIndex)
+		{
+			PassParameters->FrustumPlanes[PlaneIndex] = FVector4f(InViewDesc.Planes[PlaneIndex]);
+		}
+
+		// Unused VHM fields — must still be set to valid values.
+		PassParameters->HeightMinMaxTexture   = ExampleIndirectInstancingMesh::GHeightMinMaxDefaultTexture->TextureRHI;
+		PassParameters->MinMaxTextureSampler  = TStaticSamplerState<SF_Point>::GetRHI();
+		PassParameters->MinMaxLevelOffset     = 0;
+		PassParameters->PageTableTexture      = ExampleIndirectInstancingMesh::GHeightMinMaxDefaultTexture->TextureRHI;
+		PassParameters->PageTableSize         = FVector4f(1.f, 1.f, 1.f, 1.f);
+		PassParameters->PhysicalPageTransform = FVector4f(0.f, 0.f, 1.f, 1.f);
+		PassParameters->NumPhysicalAddressBits = 0;
 
 		FCullInstancesVHM_CS::FPermutationDomain PermutationVector;
 		PermutationVector.Set<FCullInstancesVHM_CS::FReuseCullDim>(InViewDesc.bIsMainView);
 
 		TShaderMapRef<FCullInstancesVHM_CS> ComputeShader(InGlobalShaderMap, PermutationVector);
+
+		// One thread per source instance, rounded up to 64-thread groups.
+		const uint32 NumGroups = FMath::DivideAndRoundUp(InNumSourceInstances, 64u);
 		FComputeShaderUtils::AddPass(
 				GraphBuilder,
 				RDG_EVENT_NAME("CullInstances"),
 				ComputeShader, PassParameters,
-				InVolatileResources.IndirectArgsBuffer,
-				IndirectArgOffset);
+				FIntVector((int32)NumGroups, 1, 1));
 	}
 }
 
@@ -938,10 +1020,11 @@ void FExampleIndirectInstancingRendererExtension::SubmitWork(FRDGBuilder &GraphB
 	}
 	AddPass_TransitionAllDrawBuffers(GraphBuilder, Buffers, UsedBufferIndices, true);
 
-	// Add passes to initialize the output buffers
+	// Add passes to initialize the output buffers using the real mesh index count.
 	for (FWorkDesc WorkDesc : WorkDescs)
 	{
-		AddPass_InitInstanceBuffer(GraphBuilder, GetGlobalShaderMap(GMaxRHIFeatureLevel), Buffers[WorkDesc.BufferIndex]);
+		FExampleIndirectInstancingSceneProxy const* InitProxy = SceneProxies[WorkDesc.ProxyIndex];
+		AddPass_InitInstanceBuffer(GraphBuilder, GetGlobalShaderMap(GMaxRHIFeatureLevel), Buffers[WorkDesc.BufferIndex], InitProxy->MeshNumIndices);
 	}
 
 	// Iterate workloads and submit work
@@ -1035,7 +1118,14 @@ void FExampleIndirectInstancingRendererExtension::SubmitWork(FRDGBuilder &GraphB
 				}
 
 				// Build graph
-				ExampleIndirectInstancingMesh::AddPass_CullInstances(GraphBuilder, GetGlobalShaderMap(GMaxRHIFeatureLevel), ProxyDesc, VolatileResources, Buffers[WorkDescs[WorkIndex].BufferIndex], ChildViewDesc);
+				ExampleIndirectInstancingMesh::AddPass_CullInstances(
+					GraphBuilder,
+					GetGlobalShaderMap(GMaxRHIFeatureLevel),
+					ProxyDesc, VolatileResources,
+					Buffers[WorkDescs[WorkIndex].BufferIndex],
+					ChildViewDesc,
+					Proxy->SourceInstanceBufferSRV.GetReference(),
+					(uint32)Proxy->CpuInstanceData.Num());
 
 				WorkIndex++;
 			}

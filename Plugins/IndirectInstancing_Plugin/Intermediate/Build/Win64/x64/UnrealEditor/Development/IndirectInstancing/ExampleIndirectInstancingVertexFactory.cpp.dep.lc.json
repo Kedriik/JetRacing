@@ -1,0 +1,19 @@
+{
+    "Version": "1.2",
+    "Data": {
+        "Source": "c:\\users\\kedriik\\documents\\unreal projects\\jetracing\\plugins\\indirectinstancing_plugin\\source\\indirectinstancing\\private\\exampleindirectinstancing\\exampleindirectinstancingvertexfactory.cpp",
+        "ProvidedModule": "",
+        "PCH": "f:\\ue5.5.3\\engine\\intermediate\\build\\win64\\x64\\unrealeditor\\development\\unrealed\\sharedpch.unrealed.project.valapi.cpp20.h.pch",
+        "Includes": [
+            "c:\\users\\kedriik\\documents\\unreal projects\\jetracing\\plugins\\indirectinstancing_plugin\\intermediate\\build\\win64\\x64\\unrealeditor\\development\\indirectinstancing\\definitions.indirectinstancing.h",
+            "c:\\users\\kedriik\\documents\\unreal projects\\jetracing\\plugins\\indirectinstancing_plugin\\source\\indirectinstancing\\private\\exampleindirectinstancing\\exampleindirectinstancingvertexfactory.h",
+            "f:\\ue5.5.3\\engine\\source\\runtime\\renderer\\public\\meshmaterialshader.h",
+            "f:\\ue5.5.3\\engine\\source\\runtime\\renderer\\public\\materialshader.h",
+            "f:\\ue5.5.3\\engine\\source\\runtime\\engine\\public\\materialdomain.h",
+            "f:\\ue5.5.3\\engine\\intermediate\\build\\win64\\unrealeditor\\inc\\engine\\uht\\materialdomain.generated.h",
+            "f:\\ue5.5.3\\engine\\source\\runtime\\renderer\\public\\meshdrawshaderbindings.h"
+        ],
+        "ImportedModules": [],
+        "ImportedHeaderUnits": []
+    }
+}

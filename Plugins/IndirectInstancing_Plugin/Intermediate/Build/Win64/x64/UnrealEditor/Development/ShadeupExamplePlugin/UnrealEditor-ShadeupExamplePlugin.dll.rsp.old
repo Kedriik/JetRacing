@@ -36,10 +36,10 @@
 /NODEFAULTLIB:"LIBCPD"
 /FUNCTIONPADMIN:6
 /NOIMPLIB
-"F:\JetRacing\Intermediate\Build\Win64\x64\JetRacingEditor\Development\UnrealEd\SharedPCH.UnrealEd.Project.ValApi.Cpp20.h.obj"
-"F:\JetRacing\Plugins\DisabledPlugin\IndirectInstancing_Plugin\Intermediate\Build\Win64\x64\UnrealEditor\Development\ShadeupExamplePlugin\ShadeupExamplePlugin.cpp.obj"
-"F:\JetRacing\Plugins\DisabledPlugin\IndirectInstancing_Plugin\Intermediate\Build\Win64\x64\UnrealEditor\Development\ShadeupExamplePlugin\PerModuleInline.gen.cpp.obj"
-"F:\JetRacing\Plugins\DisabledPlugin\IndirectInstancing_Plugin\Intermediate\Build\Win64\x64\UnrealEditor\Development\ShadeupExamplePlugin\Default.rc2.res"
+"..\Intermediate\Build\Win64\x64\UnrealEditor\Development\UnrealEd\SharedPCH.UnrealEd.Project.ValApi.Cpp20.h.obj"
+"C:\Users\Kedriik\Documents\Unreal Projects\JetRacing\Plugins\IndirectInstancing_Plugin\Intermediate\Build\Win64\x64\UnrealEditor\Development\ShadeupExamplePlugin\ShadeupExamplePlugin.cpp.obj"
+"C:\Users\Kedriik\Documents\Unreal Projects\JetRacing\Plugins\IndirectInstancing_Plugin\Intermediate\Build\Win64\x64\UnrealEditor\Development\ShadeupExamplePlugin\PerModuleInline.gen.cpp.obj"
+"..\Intermediate\Build\Win64\x64\UnrealEditor\Development\Default.rc2.res"
 "..\Intermediate\Build\Win64\x64\UnrealEditor\Development\CoreUObject\UnrealEditor-CoreUObject.lib"
 "..\Intermediate\Build\Win64\x64\UnrealEditor\Development\Engine\UnrealEditor-Engine.lib"
 "..\Intermediate\Build\Win64\x64\UnrealEditor\Development\Slate\UnrealEditor-Slate.lib"
@@ -70,6 +70,6 @@
 "synchronization.lib"
 "dwmapi.lib"
 "imm32.lib"
-/OUT:"F:\JetRacing\Plugins\DisabledPlugin\IndirectInstancing_Plugin\Binaries\Win64\UnrealEditor-ShadeupExamplePlugin.dll"
-/PDB:"F:\JetRacing\Plugins\DisabledPlugin\IndirectInstancing_Plugin\Binaries\Win64\UnrealEditor-ShadeupExamplePlugin.pdb"
+/OUT:"C:\Users\Kedriik\Documents\Unreal Projects\JetRacing\Plugins\IndirectInstancing_Plugin\Binaries\Win64\UnrealEditor-ShadeupExamplePlugin.dll"
+/PDB:"C:\Users\Kedriik\Documents\Unreal Projects\JetRacing\Plugins\IndirectInstancing_Plugin\Binaries\Win64\UnrealEditor-ShadeupExamplePlugin.pdb"
 /ignore:4078
