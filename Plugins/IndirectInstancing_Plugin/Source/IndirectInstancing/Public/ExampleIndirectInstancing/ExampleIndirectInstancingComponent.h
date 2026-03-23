@@ -17,41 +17,59 @@ class INDIRECTINSTANCING_API UExampleIndirectInstancingComponent : public UPrimi
 	GENERATED_UCLASS_BODY()
 
 protected:
-	/** Material applied to each instance. */
 	UPROPERTY(EditAnywhere, Category = Rendering)
 	UMaterialInterface* Material = nullptr;
 
 public:
-	/** Static mesh to render via indirect instancing. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Rendering)
 	UStaticMesh* Mesh = nullptr;
 
 	/**
-	 * World-space transforms for each instance.
-	 * Leave empty to render a single instance at the component's own transform.
+	 * Per-instance transforms in component LOCAL SPACE.
+	 * The vertex shader applies the component's LocalToWorld on top, so (0,0,0)
+	 * means "at the component's own location in the world".
+	 * Leave empty with bAutoSpawnInstances=true to auto-generate random instances.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Instancing)
 	TArray<FTransform> InstanceTransforms;
 
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Instancing|AutoSpawn")
+	bool bAutoSpawnInstances = true;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Instancing|AutoSpawn", meta = (ClampMin = "1", ClampMax = "100000"))
+	int32 RandomInstanceCount = 1000;
+
+	/** Half-extent (cm) in local XY around the component origin. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Instancing|AutoSpawn", meta = (ClampMin = "1.0"))
+	float SpawnRadius = 5000.f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Instancing|AutoSpawn", meta = (ClampMin = "0.01"))
+	float ScaleMin = 0.5f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Instancing|AutoSpawn", meta = (ClampMin = "0.01"))
+	float ScaleMax = 2.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Instancing|AutoSpawn")
+	int32 RandomSeed = 42;
+
 	UMaterialInterface* GetMaterial() const { return Material; }
 
+	/** Refill InstanceTransforms with new random instances and recreate the render state. */
+	UFUNCTION(BlueprintCallable, Category = "Instancing|AutoSpawn")
+	void RegenerateRandomInstances();
+
 protected:
-	//~ Begin UActorComponent Interface
 	virtual void OnRegister() override;
 	virtual void OnUnregister() override;
 	virtual void ApplyWorldOffset(const FVector& InOffset, bool bWorldShift) override;
-	//~ End UActorComponent Interface
-
-	//~ Begin USceneComponent Interface
 	virtual bool IsVisible() const override;
 	virtual FBoxSphereBounds CalcBounds(const FTransform& LocalToWorld) const override;
-	//~ EndUSceneComponent Interface
-
-	//~ Begin UPrimitiveComponent Interface
 	virtual FPrimitiveSceneProxy* CreateSceneProxy() override;
 	virtual bool SupportsStaticLighting() const override { return true; }
 	virtual void SetMaterial(int32 ElementIndex, class UMaterialInterface* Material) override;
 	virtual UMaterialInterface* GetMaterial(int32 Index) const override { return Material; }
 	virtual void GetUsedMaterials(TArray<UMaterialInterface*>& OutMaterials, bool bGetDebugMaterials = false) const override;
-	//~ End UPrimitiveComponent Interface
+
+private:
+	void PopulateRandomInstances();
 };

@@ -55,21 +55,30 @@ struct FVertexFactoryInterpolantsVSToPS
 
 /**
  * Reconstruct the 4x4 instance-to-world matrix from a MeshRenderInstance.
- * Storage layout: Row0 = (m00, m01, m02, tx), Row1 = (m10, m11, m12, ty), Row2 = (m20, m21, m22, tz).
- * For HLSL mul(float4(pos,1), M) (vector on left), M must be row-major with translation in column 3.
- * float4x4 constructor takes rows, so:
- *   Row 0 = (m00, m01, m02, tx)
- *   Row 1 = (m10, m11, m12, ty)
- *   Row 2 = (m20, m21, m22, tz)
- *   Row 3 = (0,   0,   0,   1 )
+ *
+ * The CPU packs COLUMNS of the TRS matrix into the three float4 fields:
+ *   InstanceToWorld0 = TRS column 0 = (R00, R10, R20, Tx)
+ *   InstanceToWorld1 = TRS column 1 = (R01, R11, R21, Ty)
+ *   InstanceToWorld2 = TRS column 2 = (R02, R12, R22, Tz)
+ *
+ * HLSL float4x4(a,b,c,d) treats each argument as a ROW, so passing the
+ * TRS columns as rows produces the TRANSPOSE of the TRS.  When we then
+ * use mul(M, float4(pos,1)) (matrix on left, column-vector on right):
+ *
+ *   result.x = Transpose[0] · (px,py,pz,1)
+ *            = R00*px + R10*py + R20*pz + Tx   ✓
+ *   result.y = R01*px + R11*py + R21*pz + Ty   ✓
+ *   result.z = R02*px + R12*py + R22*pz + Tz   ✓
  */
 float4x4 GetInstanceToWorldMatrix(MeshRenderInstance Inst)
 {
+	// Passing TRS columns as rows gives us Transpose(TRS).
+	// mul(Transpose(TRS), col_vector) == TRS * pos + Translation.
 	return float4x4(
-		Inst.InstanceToWorld0,               // row 0
-		Inst.InstanceToWorld1,               // row 1
-		Inst.InstanceToWorld2,               // row 2
-		float4(0.0f, 0.0f, 0.0f, 1.0f)      // row 3
+		Inst.InstanceToWorld0,            // row 0 = TRS col 0
+		Inst.InstanceToWorld1,            // row 1 = TRS col 1
+		Inst.InstanceToWorld2,            // row 2 = TRS col 2
+		float4(0.0f, 0.0f, 0.0f, 1.0f)   // row 3
 	);
 }
 
@@ -108,8 +117,10 @@ FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput In
 
 	// Transform position and normal into instance world space.
 	// The result is still treated as "local" by the primitive's LocalToWorld below.
-	Intermediates.LocalPos   = mul(float4(Intermediates.LocalPos, 1.0f), InstToWorld).xyz;
-	Intermediates.WorldNormal = normalize(mul(float4(Intermediates.LocalNormal, 0.0f), InstToWorld).xyz);
+	// mul(M, col_vector): matrix left, column vector right.
+	// InstToWorld stores Transpose(TRS) so mul(Transpose(TRS), v) == TRS*v, giving rotation+scale+translation.
+	Intermediates.LocalPos    = mul(InstToWorld, float4(Intermediates.LocalPos, 1.0f)).xyz;
+	Intermediates.WorldNormal = normalize(mul(InstToWorld, float4(Intermediates.LocalNormal, 0.0f)).xyz);
 
 	return Intermediates;
 }

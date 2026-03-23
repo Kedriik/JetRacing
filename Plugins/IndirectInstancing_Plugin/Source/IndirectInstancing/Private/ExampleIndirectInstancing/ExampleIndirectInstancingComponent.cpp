@@ -6,6 +6,7 @@
 #include "Engine/World.h"
 #include "ExampleIndirectInstancingSceneProxy.h"
 #include "Materials/MaterialInterface.h"
+#include "Math/RandomStream.h"
 
 UExampleIndirectInstancingComponent::UExampleIndirectInstancingComponent(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
@@ -22,12 +23,39 @@ UExampleIndirectInstancingComponent::UExampleIndirectInstancingComponent(const F
 	Mobility = EComponentMobility::Static;
 }
 
+void UExampleIndirectInstancingComponent::PopulateRandomInstances()
+{
+	InstanceTransforms.Reset(RandomInstanceCount);
+	FRandomStream Stream(RandomSeed);
+
+	for (int32 i = 0; i < RandomInstanceCount; ++i)
+	{
+		// Local-space XY offset — the component's LocalToWorld in the vertex
+		// shader will map these into the correct world positions automatically.
+		const float X = Stream.FRandRange(-SpawnRadius, SpawnRadius);
+		const float Y = Stream.FRandRange(-SpawnRadius, SpawnRadius);
+		const FRotator Rotation(0.f, Stream.FRandRange(0.f, 360.f), 0.f);
+		const float Scale = Stream.FRandRange(ScaleMin, ScaleMax);
+
+		FTransform T;
+		T.SetLocation(FVector(X, Y, 0.f));
+		T.SetRotation(Rotation.Quaternion());
+		T.SetScale3D(FVector(Scale));
+		InstanceTransforms.Add(T);
+	}
+}
+
+void UExampleIndirectInstancingComponent::RegenerateRandomInstances()
+{
+	PopulateRandomInstances();
+	MarkRenderStateDirty();
+}
+
 void UExampleIndirectInstancingComponent::OnRegister()
 {
 	Super::OnRegister();
-	SetMobility( EComponentMobility::Movable );	
+	SetMobility(EComponentMobility::Movable);
 
-	// Ensure required shader permutations are compiled on the game thread.
 	if (Material != nullptr)
 	{
 		Material->CheckMaterialUsage(MATUSAGE_VirtualHeightfieldMesh);
@@ -41,6 +69,7 @@ void UExampleIndirectInstancingComponent::OnUnregister()
 
 void UExampleIndirectInstancingComponent::ApplyWorldOffset(const FVector& InOffset, bool bWorldShift)
 {
+	// Instance transforms are local-space — world origin rebasing doesn't affect them.
 	Super::ApplyWorldOffset(InOffset, bWorldShift);
 	MarkRenderStateDirty();
 }
@@ -52,19 +81,17 @@ bool UExampleIndirectInstancingComponent::IsVisible() const
 
 FBoxSphereBounds UExampleIndirectInstancingComponent::CalcBounds(const FTransform& LocalToWorld) const
 {
-	// If we have explicit instance transforms, union their positions with a generous mesh-size radius.
 	if (InstanceTransforms.Num() > 0)
 	{
-		FBox InstanceBounds(ForceInit);
+		FBox LocalBounds(ForceInit);
 		for (const FTransform& T : InstanceTransforms)
 		{
-			InstanceBounds += T.GetTranslation();
+			LocalBounds += T.GetTranslation();
 		}
-		InstanceBounds = InstanceBounds.ExpandBy(FVector(10000.f));
-		return FBoxSphereBounds(InstanceBounds);
+		LocalBounds = LocalBounds.ExpandBy(FVector(ScaleMax * 200.f));
+		return FBoxSphereBounds(LocalBounds).TransformBy(LocalToWorld);
 	}
-
-	return FBoxSphereBounds(FBox(FVector(0.f, 0.f, 0.f), FVector(10000.f))).TransformBy(LocalToWorld);
+	return FBoxSphereBounds(FBox(FVector(-SpawnRadius), FVector(SpawnRadius))).TransformBy(LocalToWorld);
 }
 
 FPrimitiveSceneProxy* UExampleIndirectInstancingComponent::CreateSceneProxy()
@@ -73,6 +100,14 @@ FPrimitiveSceneProxy* UExampleIndirectInstancingComponent::CreateSceneProxy()
 	{
 		return nullptr;
 	}
+
+	// Generate instances in local space right before the proxy reads them.
+	// Local space means we never need a valid world transform here.
+	if (bAutoSpawnInstances && InstanceTransforms.Num() == 0)
+	{
+		PopulateRandomInstances();
+	}
+
 	return new FExampleIndirectInstancingSceneProxy(this);
 }
 
