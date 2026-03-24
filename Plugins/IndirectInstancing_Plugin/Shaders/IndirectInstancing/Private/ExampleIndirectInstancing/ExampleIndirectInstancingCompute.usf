@@ -3,8 +3,6 @@
 
 #include "/Engine/Private/Common.ush"
 #include "/Engine/Private/MortonCode.ush"
-//#include "/Engine/Private/ShaderPrintCommon.ush"
-//#include "/Engine/Private/ShaderDrawDebug.ush"
 #include "ExampleIndirectInstancing.ush"
 
 groupshared uint NumGroupTasks;
@@ -18,10 +16,7 @@ Buffer<uint2> QuadBuffer;
 RWBuffer<uint> RWIndirectArgsBuffer;
 Buffer<uint> IndirectArgsBufferSRV;
 
-// Output: surviving per-instance transforms (written by CullInstancesCS).
 RWStructuredBuffer<MeshRenderInstance> RWInstanceBuffer;
-
-// Input: full list of instances uploaded from CPU each frame.
 StructuredBuffer<MeshRenderInstance> SourceInstanceBuffer;
 uint NumSourceInstances;
 
@@ -54,80 +49,44 @@ float3 UVToWorldScale;
 
 int NumIndices;
 
-/** Return false if the AABB is completely outside one of the planes. */
-bool PlaneTestAABB(float4 InPlanes[5], float3 InCenter, float3 InExtent)
-{
-	bool bPlaneTest = true;
-	
-	[unroll]
-	for (uint PlaneIndex = 0; PlaneIndex < 5; ++PlaneIndex)
-	{
-		float3 PlaneSigns;
-		PlaneSigns.x = InPlanes[PlaneIndex].x >= 0.f ? 1.f : -1.f;
-		PlaneSigns.y = InPlanes[PlaneIndex].y >= 0.f ? 1.f : -1.f;
-		PlaneSigns.z = InPlanes[PlaneIndex].z >= 0.f ? 1.f : -1.f;
-
-		bool bInsidePlane = dot(InPlanes[PlaneIndex], float4(InCenter + InExtent * PlaneSigns, 1.0f)) > 0.f;
-		bPlaneTest = bPlaneTest && bInsidePlane;
-	}
-
-	return bPlaneTest;
-}
-
-/**
- * Compute shader to initialize all buffers, including adding the lowest mip page(s) to the QuadBuffer.
- */
-
 [numthreads(1, 1, 1)]
 void InitBuffersCS()
 {
-	// Seed with one item in the queue.
 	RWQueueInfo[0].Read = 0;
 	RWQueueInfo[0].Write = 1;
 	RWQueueInfo[0].NumActive = 1;
 
 	RWQueueBuffer[0] = Pack(InitQuadItem(0, 12));
 
-	// CullInstances indirect args
-	RWIndirectArgsBuffer[0] = 0; // Increment this wave counter during CollectQuadsCS.
+	RWIndirectArgsBuffer[0] = 0;
 	RWIndirectArgsBuffer[1] = 1;
 	RWIndirectArgsBuffer[2] = 1;
-	RWIndirectArgsBuffer[3] = 0; // Increment this instance counter counter during CollectQuadsCS.
+	RWIndirectArgsBuffer[3] = 0;
 }
-
-/**
- * Compute shader to traverse the virtual texture page table and generate an array of items to potentially render for a view.
- */
 
 [numthreads(64, 1, 1)]
 void CollectQuadsCS(
 	uint3 DispatchThreadId : SV_DispatchThreadID,
 	uint GroupIndex : SV_GroupIndex )
 {
-	// Persistant threads stay alive until the work queue is drained.
 	bool bExit = false;
 	while (!bExit)
 	{
-		// Sync and init group task count.
 		NumGroupTasks = 0;
 		GroupMemoryBarrierWithGroupSync();
 		
-		// Try and pull a task.
 		int NumActive;
 		InterlockedAdd(RWQueueInfo[0].NumActive, -1, NumActive);
 		
 		if (NumActive <= 0)
 		{
-			// No task pulled. Rewind.
 			InterlockedAdd(RWQueueInfo[0].NumActive, 1, NumActive);
 		}
 		else
 		{
-			// Increment group task count for this loop.
 			uint Dummy;
 			InterlockedAdd(NumGroupTasks, 1, Dummy);
 
-			// Read item to process from queue.
 			uint Read;
 			InterlockedAdd(RWQueueInfo[0].Read, 1, Read);
 			
@@ -136,46 +95,13 @@ void CollectQuadsCS(
 			uint Address = Item.Address;
 			uint2 Pos = MortonDecode(Address);
 			uint Level = Item.Level;
-			
-			// Check if frustum culled
-			bool bCull = false; //!PlaneTestAABB(FrustumPlanes, float2(0.5, 0.5), float2(1, 1));
 
-			bool bSubdivide = false;
-			if (bCull)
-			{
-				// Store, but don't subdivide.
-				// DebugDrawUVBox(UVMin, UVMax, UVToWorld, float4(0, 0, 1, 1));
-			}
-			else if (Level > 0)
-			{
-				// Subdivide if minimum continuous lod can be less than the current level.
-				// bSubdivide = true;
-			}
-
-			if (bSubdivide)
-			{
-				// Add children to queue.
-				uint Write;
-				InterlockedAdd(RWQueueInfo[0].Write, 4, Write);
-
-				RWQueueBuffer[(Write + 0) & QueueBufferSizeMask] = Pack(InitQuadItem(Address * 4 + 0, Level - 1));
-				RWQueueBuffer[(Write + 1) & QueueBufferSizeMask] = Pack(InitQuadItem(Address * 4 + 1, Level - 1));
-				RWQueueBuffer[(Write + 2) & QueueBufferSizeMask] = Pack(InitQuadItem(Address * 4 + 2, Level - 1));
-				RWQueueBuffer[(Write + 3) & QueueBufferSizeMask] = Pack(InitQuadItem(Address * 4 + 3, Level - 1));
-
-				InterlockedAdd(RWQueueInfo[0].NumActive, 4, NumActive);
-			}
-			else
-			{
-				uint Write;
-				InterlockedAdd(RWIndirectArgsBuffer[3], 1, Write);
-				InterlockedMax(RWIndirectArgsBuffer[0], ((Write + 1) + 63) / 64);
-
-				RWQuadBuffer[Write] = Pack(InitQuadRenderItem(Pos, Level, 0, bCull));
-			}
+			uint Write;
+			InterlockedAdd(RWIndirectArgsBuffer[3], 1, Write);
+			InterlockedMax(RWIndirectArgsBuffer[0], ((Write + 1) + 63) / 64);
+			RWQuadBuffer[Write] = Pack(InitQuadRenderItem(Pos, Level, 0, false));
 		}
 
-		// Exit if no work was found.
 		DeviceMemoryBarrier();
 		if (NumGroupTasks == 0)
 		{
@@ -185,30 +111,22 @@ void CollectQuadsCS(
 }
 
 /**
- * Initialise the indirect args for the final DrawIndexedInstancedIndirect call.
- * Layout matches D3D DrawIndexedInstancedIndirect / VkDrawIndexedIndirectCommand:
- *   [0] IndexCountPerInstance  (set to real mesh LOD index count)
- *   [1] InstanceCount          (incremented atomically by CullInstancesCS)
- *   [2] StartIndexLocation
- *   [3] BaseVertexLocation
- *   [4] StartInstanceLocation
+ * Initialise the indirect draw args.
+ * InstanceCount is set directly to NumSourceInstances — no culling.
  */
 [numthreads(1, 1, 1)]
 void InitInstanceBufferCS()
 {
-	RWIndirectArgsBuffer[0] = (uint)NumIndices; // real mesh index count
-	RWIndirectArgsBuffer[1] = 0;               // InstanceCount — filled by CullInstancesCS
+	RWIndirectArgsBuffer[0] = (uint)NumIndices; // IndexCountPerInstance
+	RWIndirectArgsBuffer[1] = NumSourceInstances; // InstanceCount — all instances, no culling
 	RWIndirectArgsBuffer[2] = 0;
 	RWIndirectArgsBuffer[3] = 0;
 	RWIndirectArgsBuffer[4] = 0;
 }
 
 /**
- * Frustum-cull every source instance and write surviving ones into RWInstanceBuffer.
+ * Copy all source instances into the output buffer — no frustum culling.
  * One thread per source instance.
- *
- * We use the translation column of the 3x4 instance-to-world matrix as the
- * instance world origin, then test a conservative sphere against the 5 planes.
  */
 [numthreads(64, 1, 1)]
 void CullInstancesCS( uint3 DispatchThreadId : SV_DispatchThreadID )
@@ -217,19 +135,5 @@ void CullInstancesCS( uint3 DispatchThreadId : SV_DispatchThreadID )
 	if (InstanceIndex >= NumSourceInstances)
 		return;
 
-	MeshRenderInstance Inst = SourceInstanceBuffer[InstanceIndex];
-
-	// Translation is stored in the .w component of each row.
-	float3 WorldOrigin = float3(Inst.InstanceToWorld0.w, Inst.InstanceToWorld1.w, Inst.InstanceToWorld2.w);
-
-	// Conservative sphere radius — replace with a real per-mesh bound if available.
-	float3 Extent = float3(200.0f, 200.0f, 200.0f);
-	bool bVisible = PlaneTestAABB(FrustumPlanes, WorldOrigin, Extent);
-
-	if (bVisible)
-	{
-		uint WriteSlot;
-		InterlockedAdd(RWIndirectArgsBuffer[1], 1, WriteSlot);
-		RWInstanceBuffer[WriteSlot] = Inst;
-	}
+	RWInstanceBuffer[InstanceIndex] = SourceInstanceBuffer[InstanceIndex];
 }

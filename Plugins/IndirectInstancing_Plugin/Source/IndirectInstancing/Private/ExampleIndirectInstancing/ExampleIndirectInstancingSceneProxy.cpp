@@ -648,6 +648,7 @@ namespace ExampleIndirectInstancingMesh
 
 		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER(int32, NumIndices)
+		SHADER_PARAMETER(uint32, NumSourceInstances)
 		SHADER_PARAMETER_UAV(RWBuffer<uint>, RWIndirectArgsBuffer)
 		END_SHADER_PARAMETER_STRUCT()
 
@@ -943,12 +944,13 @@ namespace ExampleIndirectInstancingMesh
 				ComputeShader, PassParameters, FIntVector(InDesc.NumCollectPassWavefronts, 1, 1));
 	}
 
-	void AddPass_InitInstanceBuffer(FRDGBuilder & GraphBuilder, FGlobalShaderMap * InGlobalShaderMap, FDrawInstanceBuffers & InOutputResources, int32 InNumIndices)
+	void AddPass_InitInstanceBuffer(FRDGBuilder & GraphBuilder, FGlobalShaderMap * InGlobalShaderMap, FDrawInstanceBuffers & InOutputResources, int32 InNumIndices, uint32 InNumSourceInstances)
 	{
 		TShaderMapRef<FInitInstanceBufferVHM_CS> ComputeShader(InGlobalShaderMap);
 
 		FInitInstanceBufferVHM_CS::FParameters *PassParameters = GraphBuilder.AllocParameters<FInitInstanceBufferVHM_CS::FParameters>();
-		PassParameters->NumIndices = InNumIndices;
+		PassParameters->NumIndices          = InNumIndices;
+		PassParameters->NumSourceInstances  = InNumSourceInstances;
 		PassParameters->RWIndirectArgsBuffer = InOutputResources.IndirectArgsBufferUAV;
 
 		FComputeShaderUtils::AddPass(
@@ -1010,7 +1012,7 @@ void FExampleIndirectInstancingRendererExtension::SubmitWork(FRDGBuilder &GraphB
 	for (FWorkDesc WorkDesc : WorkDescs)
 	{
 		FExampleIndirectInstancingSceneProxy const* InitProxy = SceneProxies[WorkDesc.ProxyIndex];
-		AddPass_InitInstanceBuffer(GraphBuilder, GetGlobalShaderMap(GMaxRHIFeatureLevel), Buffers[WorkDesc.BufferIndex], InitProxy->MeshNumIndices);
+		AddPass_InitInstanceBuffer(GraphBuilder, GetGlobalShaderMap(GMaxRHIFeatureLevel), Buffers[WorkDesc.BufferIndex], InitProxy->MeshNumIndices, (uint32)InitProxy->CpuInstanceData.Num());
 	}
 
 	const int32 NumWorkItems = WorkDescs.Num();
