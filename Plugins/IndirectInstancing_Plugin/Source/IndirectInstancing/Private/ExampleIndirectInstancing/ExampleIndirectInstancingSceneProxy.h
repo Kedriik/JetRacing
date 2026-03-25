@@ -76,4 +76,8 @@ public:
 
 	FBufferRHIRef             SourceInstanceBuffer;
 	FShaderResourceViewRHIRef SourceInstanceBufferSRV;
+
+	// Pre-filled indirect draw args: [IndexCount, InstanceCount, 0, 0, 0]
+	// Built once in CreateRenderThreadResources — no compute passes needed.
+	FBufferRHIRef             IndirectArgsBuffer;
 };

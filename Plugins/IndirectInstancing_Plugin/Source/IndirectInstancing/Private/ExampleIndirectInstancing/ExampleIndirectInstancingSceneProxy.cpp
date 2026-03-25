@@ -364,21 +364,26 @@ FExampleIndirectInstancingSceneProxy::FExampleIndirectInstancingSceneProxy(UExam
 	// The USH change: float4x4(col0,col1,col2,col3) and mul(M,v).
 	// -----------------------------------------------------------------------
 
-	auto MakeRow = [](const FTransform& T) -> FInstanceTransform
+	// Capture the component's world transform once.
+	// We bake it into every instance matrix so the GPU matrices are true
+	// local-to-world transforms.  The vertex shader then outputs world-space
+	// positions/normals directly, bypassing the primitive's LocalToWorld.
+	const FMatrix44f ComponentToWorld(InComponent->GetComponentTransform().ToMatrixWithScale());
+
+	auto MakeRow = [&ComponentToWorld](const FTransform& T) -> FInstanceTransform
 	{
-		const FMatrix44f M(T.ToMatrixWithScale());
-		// Store columns of the 4×4 TRS matrix in the three float4 rows.
-		// UE FMatrix: M[row][col], translation at M[3][0..2].
-		//   Col 0 = (M[0][0], M[1][0], M[2][0], M[3][0]) = (R00, R10, R20, Tx)
-		//   Col 1 = (M[0][1], M[1][1], M[2][1], M[3][1]) = (R01, R11, R21, Ty)
-		//   Col 2 = (M[0][2], M[1][2], M[2][2], M[3][2]) = (R02, R12, R22, Tz)
-		// The shader reconstructs: float4x4(col0, col1, col2, (0,0,0,1)) and
-		// uses mul(M, float4(pos,1)) — column-vector convention — giving:
-		//   result = R*pos + T   ✓
+		// Compose: InstanceLocal → ComponentWorld
+		// UE FMatrix is row-major with translation at M[3][0..2].
+		// We multiply: InstLocal * ComponentToWorld to get InstToWorld.
+		const FMatrix44f InstLocal(T.ToMatrixWithScale());
+		const FMatrix44f InstToWorld = InstLocal * ComponentToWorld;
+
+		// Store columns of InstToWorld so the shader can do mul(M, col_vec).
+		// Col k = (InstToWorld[0][k], InstToWorld[1][k], InstToWorld[2][k], InstToWorld[3][k])
 		FInstanceTransform Out;
-		Out.Row0 = FVector4f(M.M[0][0], M.M[1][0], M.M[2][0], M.M[3][0]); // col 0
-		Out.Row1 = FVector4f(M.M[0][1], M.M[1][1], M.M[2][1], M.M[3][1]); // col 1
-		Out.Row2 = FVector4f(M.M[0][2], M.M[1][2], M.M[2][2], M.M[3][2]); // col 2
+		Out.Row0 = FVector4f(InstToWorld.M[0][0], InstToWorld.M[1][0], InstToWorld.M[2][0], InstToWorld.M[3][0]); // col 0
+		Out.Row1 = FVector4f(InstToWorld.M[0][1], InstToWorld.M[1][1], InstToWorld.M[2][1], InstToWorld.M[3][1]); // col 1
+		Out.Row2 = FVector4f(InstToWorld.M[0][2], InstToWorld.M[1][2], InstToWorld.M[2][2], InstToWorld.M[3][2]); // col 2
 		return Out;
 	};
 
@@ -428,7 +433,7 @@ void FExampleIndirectInstancingSceneProxy::CreateRenderThreadResources(FRHIComma
 
 	VertexFactory->InitResource(RHICmdList);
 
-	// Upload the CPU instance list to a GPU structured buffer read by CullInstancesCS.
+	// Upload the CPU instance list to a GPU structured buffer.
 	if (CpuInstanceData.Num() > 0)
 	{
 		const uint32 Stride     = sizeof(FInstanceTransform);
@@ -443,6 +448,25 @@ void FExampleIndirectInstancingSceneProxy::CreateRenderThreadResources(FRHIComma
 			BUF_ShaderResource, ERHIAccess::SRVMask, CreateInfo);
 		SourceInstanceBufferSRV = RHICmdList.CreateShaderResourceView(SourceInstanceBuffer);
 	}
+
+	// Pre-fill the indirect draw args buffer on the CPU.
+	// Layout: [IndexCountPerInstance, InstanceCount, StartIndex, BaseVertex, StartInstance]
+	// This never changes — no culling, all instances always drawn.
+	{
+		TResourceArray<uint32, VERTEXBUFFER_ALIGNMENT> Args;
+		Args.Add((uint32)MeshNumIndices);              // IndexCountPerInstance
+		Args.Add((uint32)CpuInstanceData.Num());       // InstanceCount
+		Args.Add(0u);                                  // StartIndexLocation
+		Args.Add(0u);                                  // BaseVertexLocation
+		Args.Add(0u);                                  // StartInstanceLocation
+
+		FRHIResourceCreateInfo CreateInfo(TEXT("ExampleIndirectInstancing.IndirectArgsBuffer"), &Args);
+		IndirectArgsBuffer = RHICmdList.CreateVertexBuffer(
+			5 * sizeof(uint32),
+			BUF_DrawIndirect | BUF_Static | BUF_UnorderedAccess,
+			ERHIAccess::IndirectArgs,
+			CreateInfo);
+	}
 }
 
 void FExampleIndirectInstancingSceneProxy::DestroyRenderThreadResources()
@@ -456,6 +480,7 @@ void FExampleIndirectInstancingSceneProxy::DestroyRenderThreadResources()
 
 	SourceInstanceBufferSRV.SafeRelease();
 	SourceInstanceBuffer.SafeRelease();
+	IndirectArgsBuffer.SafeRelease();
 }
 
 FPrimitiveViewRelevance FExampleIndirectInstancingSceneProxy::GetViewRelevance(const FSceneView *View) const
@@ -481,78 +506,53 @@ void FExampleIndirectInstancingSceneProxy::GetDynamicMeshElements(const TArray<c
 {
 	check(IsInRenderingThread() || IsInParallelRenderingThread());
 
-	if (!MeshIndexBuffer || MeshNumIndices == 0 || !SourceInstanceBufferSRV)
-	{
-		return;
-	}
-
-	if (ExampleIndirectInstancingRendererExtension.IsInFrame())
+	if (!MeshIndexBuffer || MeshNumIndices == 0 || !SourceInstanceBufferSRV || !IndirectArgsBuffer)
 	{
 		return;
 	}
 
 	for (int32 ViewIndex = 0; ViewIndex < Views.Num(); ViewIndex++)
 	{
-		if (VisibilityMap & (1 << ViewIndex))
+		if (!(VisibilityMap & (1 << ViewIndex)))
 		{
-			const ExampleIndirectInstancingMesh::FDrawInstanceBuffers Buffers = ExampleIndirectInstancingRendererExtension.AddWork(this, ViewFamily.Views[0], Views[ViewIndex]);
-			if (!Buffers.InstanceBufferSRV || !Buffers.IndirectArgsBuffer)
-			{
-				continue;
-			}
-
-			FMeshBatch &Mesh = Collector.AllocateMesh();
-			Mesh.bWireframe = AllowDebugViewmodes() && ViewFamily.EngineShowFlags.Wireframe;
-			Mesh.bUseWireframeSelectionColoring = IsSelected();
-			Mesh.VertexFactory = VertexFactory;
-			Mesh.MaterialRenderProxy = Material;
-			Mesh.ReverseCulling = IsLocalToWorldDeterminantNegative();
-			Mesh.Type = PT_TriangleList;
-			Mesh.DepthPriorityGroup = SDPG_World;
-			Mesh.bCanApplyViewModeOverrides = true;
-			Mesh.bUseForMaterial = true;
-			Mesh.CastShadow = true;
-			Mesh.bUseForDepthPass = true;
-
-			Mesh.Elements.SetNumZeroed(1);
-			{
-				FMeshBatchElement &BatchElement = Mesh.Elements[0];
-
-				BatchElement.IndexBuffer        = MeshIndexBuffer;
-				BatchElement.IndirectArgsBuffer = Buffers.IndirectArgsBuffer;
-				BatchElement.IndirectArgsOffset = 0;
-
-				BatchElement.FirstIndex      = 0;
-				BatchElement.NumPrimitives   = 0;
-				BatchElement.MinVertexIndex  = 0;
-				BatchElement.MaxVertexIndex  = 0;
-
-				BatchElement.PrimitiveIdMode        = PrimID_ForceZero;
-				BatchElement.PrimitiveUniformBuffer = GetUniformBuffer();
-
-				FExampleIndirectInstancingUserData *UserData = &Collector.AllocateOneFrameResource<FExampleIndirectInstancingUserData>();
-				BatchElement.UserData = (void *)UserData;
-
-				UserData->InstanceBufferSRV = Buffers.InstanceBufferSRV;
-				UserData->PositionBufferSRV = VertexFactory->PositionBufferSRV.GetReference();
-				UserData->TangentBufferSRV  = VertexFactory->TangentBufferSRV.GetReference();
-				UserData->UV0BufferSRV      = VertexFactory->UV0BufferSRV.GetReference();
-				UserData->NumTexCoords      = MeshNumTexCoords;
-
-				FSceneView const *MainView = ViewFamily.Views[0];
-				UserData->LodViewOrigin = (FVector3f)MainView->ViewMatrices.GetViewOrigin();
-
-#if !(UE_BUILD_SHIPPING || UE_BUILD_TEST)
-				const FViewMatrices *FrozenViewMatrices = MainView->State != nullptr ? MainView->State->GetFrozenViewMatrices() : nullptr;
-				if (FrozenViewMatrices != nullptr)
-				{
-					UserData->LodViewOrigin = (FVector3f)FrozenViewMatrices->GetViewOrigin();
-				}
-#endif
-			}
-
-			Collector.AddMesh(ViewIndex, Mesh);
+			continue;
 		}
+
+		FMeshBatch& Mesh = Collector.AllocateMesh();
+		Mesh.bWireframe             = AllowDebugViewmodes() && ViewFamily.EngineShowFlags.Wireframe;
+		Mesh.bUseWireframeSelectionColoring = IsSelected();
+		Mesh.VertexFactory          = VertexFactory;
+		Mesh.MaterialRenderProxy    = Material;
+		Mesh.ReverseCulling         = IsLocalToWorldDeterminantNegative();
+		Mesh.Type                   = PT_TriangleList;
+		Mesh.DepthPriorityGroup     = SDPG_World;
+		Mesh.bCanApplyViewModeOverrides = true;
+		Mesh.bUseForMaterial        = true;
+		Mesh.CastShadow             = true;
+		Mesh.bUseForDepthPass       = true;
+
+		FMeshBatchElement& BatchElement = Mesh.Elements[0];
+		BatchElement.IndexBuffer        = MeshIndexBuffer;
+		BatchElement.IndirectArgsBuffer = IndirectArgsBuffer;
+		BatchElement.IndirectArgsOffset = 0;
+		BatchElement.FirstIndex         = 0;
+		BatchElement.NumPrimitives      = 0; // ignored when IndirectArgsBuffer is set
+		BatchElement.MinVertexIndex     = 0;
+		BatchElement.MaxVertexIndex     = 0;
+		BatchElement.PrimitiveIdMode        = PrimID_ForceZero;
+		BatchElement.PrimitiveUniformBuffer = GetUniformBuffer();
+
+		FExampleIndirectInstancingUserData* UserData = &Collector.AllocateOneFrameResource<FExampleIndirectInstancingUserData>();
+		BatchElement.UserData = UserData;
+
+		UserData->InstanceBufferSRV = SourceInstanceBufferSRV.GetReference();
+		UserData->PositionBufferSRV = VertexFactory->PositionBufferSRV.GetReference();
+		UserData->TangentBufferSRV  = VertexFactory->TangentBufferSRV.GetReference();
+		UserData->UV0BufferSRV      = VertexFactory->UV0BufferSRV.GetReference();
+		UserData->NumTexCoords      = MeshNumTexCoords;
+		UserData->LodViewOrigin     = (FVector3f)ViewFamily.Views[0]->ViewMatrices.GetViewOrigin();
+
+		Collector.AddMesh(ViewIndex, Mesh);
 	}
 }
 

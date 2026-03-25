@@ -1,0 +1,16 @@
+{
+	"RemapUnityFiles": 
+	{
+		"Module.IndirectInstancing.cpp.obj": [
+			"ExampleIndirectInstancingActor.cpp.obj",
+			"ExampleIndirectInstancingVertexFactory.cpp.obj",
+			"IndirectInstancing.cpp.obj",
+			"ExampleIndirectInstancingActor.gen.cpp.obj",
+			"ExampleIndirectInstancingComponent.gen.cpp.obj",
+			"IndirectInstancing.init.gen.cpp.obj",
+			"PerModuleInline.gen.cpp.obj",
+			"ExampleIndirectInstancingComponent.cpp.obj",
+			"ExampleIndirectInstancingSceneProxy.cpp.obj"
+		]
+	}
+}

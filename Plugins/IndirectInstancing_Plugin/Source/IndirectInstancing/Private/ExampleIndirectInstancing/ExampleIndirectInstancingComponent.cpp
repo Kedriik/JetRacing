@@ -12,10 +12,10 @@ UExampleIndirectInstancingComponent::UExampleIndirectInstancingComponent(const F
 	: Super(ObjectInitializer)
 {
 	CastShadow = true;
-	bCastContactShadow = false;
+	bCastContactShadow = true;
 	bUseAsOccluder = true;
-	bAffectDynamicIndirectLighting = false;
-	bAffectDistanceFieldLighting = false;
+	bAffectDynamicIndirectLighting = true;
+	bAffectDistanceFieldLighting = true;
 	bNeverDistanceCull = true;
 #if WITH_EDITORONLY_DATA
 	bEnableAutoLODGeneration = false;

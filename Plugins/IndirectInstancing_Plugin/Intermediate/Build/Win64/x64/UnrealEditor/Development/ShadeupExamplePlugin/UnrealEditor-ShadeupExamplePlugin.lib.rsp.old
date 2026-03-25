@@ -1,0 +1,13 @@
+/NOLOGO
+/errorReport:prompt
+/MACHINE:x64
+/SUBSYSTEM:WINDOWS
+/DEF
+/NAME:"UnrealEditor-ShadeupExamplePlugin.dll"
+/IGNORE:4221
+/NODEFAULTLIB
+"..\Intermediate\Build\Win64\x64\UnrealEditor\Development\UnrealEd\SharedPCH.UnrealEd.Project.ValApi.Cpp20.h.obj"
+"C:\Users\Kedriik\Documents\Unreal Projects\JetRacing\Plugins\IndirectInstancing_Plugin\Intermediate\Build\Win64\x64\UnrealEditor\Development\ShadeupExamplePlugin\Module.ShadeupExamplePlugin.cpp.obj"
+"C:\Users\Kedriik\Documents\Unreal Projects\JetRacing\Plugins\IndirectInstancing_Plugin\Intermediate\Build\Win64\x64\UnrealEditor\Development\ShadeupExamplePlugin\PerModuleInline.gen.cpp.obj"
+"..\Intermediate\Build\Win64\x64\UnrealEditor\Development\Default.rc2.res"
+/OUT:"C:\Users\Kedriik\Documents\Unreal Projects\JetRacing\Plugins\IndirectInstancing_Plugin\Intermediate\Build\Win64\x64\UnrealEditor\Development\ShadeupExamplePlugin\UnrealEditor-ShadeupExamplePlugin.lib"

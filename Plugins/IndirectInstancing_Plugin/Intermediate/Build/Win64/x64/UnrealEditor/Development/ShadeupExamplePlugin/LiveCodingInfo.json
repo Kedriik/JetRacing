@@ -2,8 +2,8 @@
 	"RemapUnityFiles": 
 	{
 		"Module.ShadeupExamplePlugin.cpp.obj": [
-			"ShadeupExamplePlugin.cpp.obj",
-			"PerModuleInline.gen.cpp.obj"
+			"PerModuleInline.gen.cpp.obj",
+			"ShadeupExamplePlugin.cpp.obj"
 		]
 	}
 }
