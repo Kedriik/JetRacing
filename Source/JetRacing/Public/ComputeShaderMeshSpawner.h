@@ -20,13 +20,10 @@ public:
     UComputeShaderMeshSpawner();
 
     // -----------------------------------------------------------------------
-    // Mesh to spawn — assign in the editor, same as the original ISMC version
+    // Assign the mesh — its material slots are used automatically.
     // -----------------------------------------------------------------------
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawning")
     TObjectPtr<UStaticMesh> FoliageMesh;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawning")
-    TObjectPtr<UMaterialInterface> FoliageMaterial;
 
     // -----------------------------------------------------------------------
     // Depth capture
@@ -93,7 +90,6 @@ public:
     virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
 
 private:
-    // Created internally in BeginPlay — not exposed in the editor
     UPROPERTY()
     TObjectPtr<UComputeDrivenIndirectInstancingComponent> IndirectInstancingComponent;
 

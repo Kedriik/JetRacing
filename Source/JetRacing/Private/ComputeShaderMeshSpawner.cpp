@@ -11,7 +11,6 @@
 #include "Engine/TextureRenderTarget2D.h"
 #include "Components/SceneCaptureComponent2D.h"
 #include "Engine/StaticMesh.h"
-#include "Materials/MaterialInterface.h"
 
 UComputeShaderMeshSpawner::UComputeShaderMeshSpawner()
 {
@@ -33,19 +32,17 @@ void UComputeShaderMeshSpawner::BeginPlay()
 
     if (FoliageMesh)
         IndirectInstancingComponent->Mesh = FoliageMesh;
-    if (FoliageMaterial)
-        IndirectInstancingComponent->Material = FoliageMaterial;
+    // Materials are read automatically from the mesh's material slots —
+    // no manual assignment needed.
 
     SetupDepthCapture();
     UpdateVoxelComponentList();
 
-    // Force a render frame so CreateRenderThreadResources fires and GPU buffers
-    // are allocated before we try to dispatch into them.
+    // Let the renderer tick once so CreateRenderThreadResources allocates
+    // the GPU buffers before we dispatch into them.
     FlushRenderingCommands();
 
     CaptureDepth();
-
-    // Block until the capture is done then dispatch once synchronously.
     FlushRenderingCommands();
     ExecuteComputeShader();
 }
@@ -97,8 +94,6 @@ void UComputeShaderMeshSpawner::CaptureDepth()
     SceneCaptureComponent->SetWorldRotation(CameraRotation);
     SceneCaptureComponent->OrthoWidth = OrthoWidth;
 
-    // CaptureScene() must be called on the game thread — it already is here,
-    // so call it directly instead of dispatching another AsyncTask.
     SceneCaptureComponent->CaptureScene();
 }
 
@@ -110,20 +105,26 @@ void UComputeShaderMeshSpawner::RunComputeShader()
     if (!IndirectInstancingComponent || !DepthRenderTarget)
         return;
 
-    // GPU buffers are allocated by the scene proxy in CreateRenderThreadResources.
-    // Guard until they are ready.
     FBufferRHIRef              CapturedInstanceBuffer    = IndirectInstancingComponent->GpuInstanceBuffer;
     FUnorderedAccessViewRHIRef CapturedInstanceBufferUAV = IndirectInstancingComponent->GpuInstanceBufferUAV;
-    FBufferRHIRef              CapturedIndirectBuffer    = IndirectInstancingComponent->GpuIndirectArgsBuffer;
-    FUnorderedAccessViewRHIRef CapturedIndirectBufferUAV = IndirectInstancingComponent->GpuIndirectArgsBufferUAV;
     int32                      CapturedMeshNumIndices    = IndirectInstancingComponent->GpuMeshNumIndices;
 
-    if (!CapturedInstanceBuffer.IsValid()    || !CapturedInstanceBufferUAV.IsValid() ||
-        !CapturedIndirectBuffer.IsValid()    || !CapturedIndirectBufferUAV.IsValid() ||
-        CapturedMeshNumIndices <= 0)
+    // All section IndirectArgs buffers — the compute shader writes InstanceCount
+    // to buffer[0], then we copy it to the rest.
+    TArray<FBufferRHIRef>              CapturedIndirectBuffers   = IndirectInstancingComponent->GpuIndirectArgsBuffers;
+    TArray<FUnorderedAccessViewRHIRef> CapturedIndirectBufferUAVs = IndirectInstancingComponent->GpuIndirectArgsBufferUAVs;
+
+    if (!CapturedInstanceBuffer.IsValid() || !CapturedInstanceBufferUAV.IsValid() ||
+        CapturedIndirectBuffers.Num() == 0 || CapturedMeshNumIndices <= 0)
     {
         UE_LOG(LogTemp, Warning, TEXT("UComputeShaderMeshSpawner: GPU buffers not ready yet."));
         return;
+    }
+
+    for (const FBufferRHIRef& Buf : CapturedIndirectBuffers)
+    {
+        if (!Buf.IsValid())
+            return;
     }
 
     FTextureRHIRef CapturedDepthTexture = DepthRenderTarget->GetResource()->TextureRHI;
@@ -148,7 +149,7 @@ void UComputeShaderMeshSpawner::RunComputeShader()
 
     ENQUEUE_RENDER_COMMAND(DispatchFoliageComputeShader)(
         [CapturedInstanceBufferUAV,
-         CapturedIndirectBuffer, CapturedIndirectBufferUAV,
+         CapturedIndirectBuffers, CapturedIndirectBufferUAVs,
          CapturedDepthTexture,
          CapturedCameraPos, CapturedCameraForward, CapturedCameraRight, CapturedCameraUp,
          CapturedOrthoWidth, CapturedOrthoHeight, CapturedNumInstances, CapturedNumIndices,
@@ -157,32 +158,47 @@ void UComputeShaderMeshSpawner::RunComputeShader()
         (FRHICommandListImmediate& RHICmdList)
         {
             // ------------------------------------------------------------------
-            // Step 1 — reset IndirectArgs BEFORE opening the RDG graph.
-            // LockBuffer is a stalling CPU-write operation and must NOT be
-            // called inside an AddPass lambda (which runs inside Execute()).
+            // Step 1 — reset all IndirectArgs buffers before the graph.
+            // Each section gets its own IndexCount (pre-baked) and InstanceCount=0.
+            // Buffer[0] is the one the compute shader atomically increments.
             // ------------------------------------------------------------------
-            RHICmdList.Transition(FRHITransitionInfo(
-                CapturedIndirectBufferUAV,
-                ERHIAccess::IndirectArgs,
-                ERHIAccess::UAVCompute));
+            for (int32 i = 0; i < CapturedIndirectBuffers.Num(); i++)
+            {
+                RHICmdList.Transition(FRHITransitionInfo(
+                    CapturedIndirectBufferUAVs[i],
+                    ERHIAccess::IndirectArgs,
+                    ERHIAccess::UAVCompute));
 
-            uint32* Data = (uint32*)RHICmdList.LockBuffer(
-                CapturedIndirectBuffer, 0, 5 * sizeof(uint32), RLM_WriteOnly);
-            Data[0] = CapturedNumIndices; // IndexCountPerInstance — constant
-            Data[1] = 0;                  // InstanceCount — compute atomically increments this
-            Data[2] = 0;
-            Data[3] = 0;
-            Data[4] = 0;
-            RHICmdList.UnlockBuffer(CapturedIndirectBuffer);
+                // Read the current args to preserve IndexCount and StartIndex
+                // which were baked at allocation time, then rewrite with InstanceCount=0.
+                uint32 SavedArgs[5];
+                {
+                    const uint32* Src = (const uint32*)RHICmdList.LockBuffer(
+                        CapturedIndirectBuffers[i], 0, 5 * sizeof(uint32), RLM_ReadOnly);
+                    FMemory::Memcpy(SavedArgs, Src, 5 * sizeof(uint32));
+                    RHICmdList.UnlockBuffer(CapturedIndirectBuffers[i]);
+                }
+                {
+                    uint32* Dst = (uint32*)RHICmdList.LockBuffer(
+                        CapturedIndirectBuffers[i], 0, 5 * sizeof(uint32), RLM_WriteOnly);
+                    Dst[0] = SavedArgs[0]; // IndexCountPerInstance — preserved
+                    Dst[1] = 0;            // InstanceCount — reset for atomic increment
+                    Dst[2] = SavedArgs[2]; // StartIndexLocation — preserved
+                    Dst[3] = 0;
+                    Dst[4] = 0;
+                    RHICmdList.UnlockBuffer(CapturedIndirectBuffers[i]);
+                }
+            }
 
-            // Transition instance buffer to UAV before the RDG graph too.
+            // Transition instance buffer to UAV
             RHICmdList.Transition(FRHITransitionInfo(
                 CapturedInstanceBufferUAV,
                 ERHIAccess::SRVMask,
                 ERHIAccess::UAVCompute));
 
             // ------------------------------------------------------------------
-            // Step 2 — RDG graph: dispatch the compute shader only.
+            // Step 2 — dispatch compute shader, writing to buffer[0] only.
+            // All sections render the same instances so InstanceCount is shared.
             // ------------------------------------------------------------------
             FRDGBuilder GraphBuilder(RHICmdList, RDG_EVENT_NAME("ComputeFoliageSpawn"));
 
@@ -190,7 +206,7 @@ void UComputeShaderMeshSpawner::RunComputeShader()
                 GraphBuilder.AllocParameters<FInstancesComputeShader::FParameters>();
 
             Parameters->SpawnInstances    = CapturedInstanceBufferUAV;
-            Parameters->IndirectArgs      = CapturedIndirectBufferUAV;
+            Parameters->IndirectArgs      = CapturedIndirectBufferUAVs[0]; // InstanceCount written here
             Parameters->SceneDepthTexture = CapturedDepthTexture;
             Parameters->SceneDepthSampler =
                 TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
@@ -211,7 +227,6 @@ void UComputeShaderMeshSpawner::RunComputeShader()
             TShaderMapRef<FInstancesComputeShader> ComputeShader(
                 GetGlobalShaderMap(GMaxRHIFeatureLevel));
 
-            // [numthreads(10,100,1)] = 1000 threads per group
             const uint32 GroupsY = FMath::DivideAndRoundUp(CapturedNumInstances, 1000u);
             FComputeShaderUtils::AddPass(
                 GraphBuilder,
@@ -223,25 +238,71 @@ void UComputeShaderMeshSpawner::RunComputeShader()
             GraphBuilder.Execute();
 
             // ------------------------------------------------------------------
-            // Step 3 — transition buffers back AFTER the graph has executed.
+            // Step 3 — propagate InstanceCount from buffer[0] to all other
+            // section buffers, then transition everything back for drawing.
             // ------------------------------------------------------------------
+            if (CapturedIndirectBuffers.Num() > 1)
+            {
+                // Read InstanceCount written by the compute shader from buffer[0]
+                RHICmdList.Transition(FRHITransitionInfo(
+                    CapturedIndirectBufferUAVs[0],
+                    ERHIAccess::UAVCompute,
+                    ERHIAccess::SRVGraphics));
+
+                const uint32* Src = (const uint32*)RHICmdList.LockBuffer(
+                    CapturedIndirectBuffers[0], 0, 5 * sizeof(uint32), RLM_ReadOnly);
+                uint32 InstanceCount = Src[1];
+                RHICmdList.UnlockBuffer(CapturedIndirectBuffers[0]);
+
+                // Write InstanceCount into all remaining section buffers,
+                // preserving their baked IndexCount and StartIndex.
+                for (int32 i = 1; i < CapturedIndirectBuffers.Num(); i++)
+                {
+                    uint32 SavedArgs[5];
+                    {
+                        const uint32* SectionSrc = (const uint32*)RHICmdList.LockBuffer(
+                            CapturedIndirectBuffers[i], 0, 5 * sizeof(uint32), RLM_ReadOnly);
+                        FMemory::Memcpy(SavedArgs, SectionSrc, 5 * sizeof(uint32));
+                        RHICmdList.UnlockBuffer(CapturedIndirectBuffers[i]);
+                    }
+                    {
+                        uint32* Dst = (uint32*)RHICmdList.LockBuffer(
+                            CapturedIndirectBuffers[i], 0, 5 * sizeof(uint32), RLM_WriteOnly);
+                        Dst[0] = SavedArgs[0]; // IndexCountPerInstance — preserved
+                        Dst[1] = InstanceCount;
+                        Dst[2] = SavedArgs[2]; // StartIndexLocation — preserved
+                        Dst[3] = 0;
+                        Dst[4] = 0;
+                        RHICmdList.UnlockBuffer(CapturedIndirectBuffers[i]);
+                    }
+
+                    RHICmdList.Transition(FRHITransitionInfo(
+                        CapturedIndirectBufferUAVs[i],
+                        ERHIAccess::UAVCompute,
+                        ERHIAccess::IndirectArgs));
+                }
+
+                // Transition buffer[0] to IndirectArgs
+                RHICmdList.Transition(FRHITransitionInfo(
+                    CapturedIndirectBufferUAVs[0],
+                    ERHIAccess::SRVGraphics,
+                    ERHIAccess::IndirectArgs));
+            }
+            else
+            {
+                RHICmdList.Transition(FRHITransitionInfo(
+                    CapturedIndirectBufferUAVs[0],
+                    ERHIAccess::UAVCompute,
+                    ERHIAccess::IndirectArgs));
+            }
+
+            // Transition instance buffer back to SRV for the vertex factory
             RHICmdList.Transition(FRHITransitionInfo(
                 CapturedInstanceBufferUAV,
                 ERHIAccess::UAVCompute,
                 ERHIAccess::SRVMask));
-
-            RHICmdList.Transition(FRHITransitionInfo(
-                CapturedIndirectBufferUAV,
-                ERHIAccess::UAVCompute,
-                ERHIAccess::IndirectArgs));
         }
     );
-
-    // NOTE: No FlushRenderingCommands() here.
-    // On the tick path the game thread must not stall waiting for the render
-    // thread every frame — that's exactly what causes the hang.
-    // The render commands are fire-and-forget; the GPU draws whatever the most
-    // recently completed dispatch wrote.
 }
 
 void UComputeShaderMeshSpawner::ExecuteComputeShader()
@@ -258,8 +319,6 @@ void UComputeShaderMeshSpawner::TickComponent(float DeltaTime, ELevelTick TickTy
     {
         CaptureDepth();
         RunComputeShader();
-        // No flush — enqueue and move on. The render thread processes it
-        // asynchronously without stalling the game thread.
     }
 }
 

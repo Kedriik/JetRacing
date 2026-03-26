@@ -13,15 +13,22 @@
 #include "StaticMeshResources.h"
 #include "RHICommandList.h"
 #include "RHIResources.h"
-#include "RenderGraphBuilder.h"
-#include "CommonRenderResources.h"
+
+// ============================================================================
+// Per-section data captured at proxy construction time
+// ============================================================================
+struct FComputeDrivenSection
+{
+	FMaterialRenderProxy* MaterialProxy   = nullptr;
+	FMaterialRelevance    MaterialRelevance;
+	uint32                FirstIndex      = 0;   // byte offset into the index buffer
+	uint32                NumIndices      = 0;   // indices in this section
+	int32                 MinVertexIndex  = 0;
+	int32                 MaxVertexIndex  = 0;
+};
 
 // ============================================================================
 // Scene proxy
-//
-// Self-contained — does NOT use FExampleIndirectInstancingRendererExtension or
-// the CullInstancesCS path.  The compute shader writes MeshRenderInstance data
-// directly into GpuInstanceBuffer, so we just bind it straight to the draw.
 // ============================================================================
 class FComputeDrivenIndirectInstancingSceneProxy final : public FPrimitiveSceneProxy
 {
@@ -29,42 +36,51 @@ public:
 	FComputeDrivenIndirectInstancingSceneProxy(UComputeDrivenIndirectInstancingComponent* InComponent)
 		: FPrimitiveSceneProxy(InComponent, FName("ComputeDrivenIndirectInstancing"))
 		, VertexFactory(nullptr)
-		, Material(nullptr)
 		, MeshIndexBuffer(nullptr)
 		, MeshVertexBuffers(nullptr)
-		, MeshNumIndices(0)
 		, MeshNumTexCoords(1)
-		// Snapshot the component's GPU buffer refs.
-		// They are null until CreateRenderThreadResources fires — GetDynamicMeshElements
-		// guards against this.
 		, ComponentInstanceBufferSRV(InComponent->GpuInstanceBufferSRV)
-		, ComponentIndirectArgsBuffer(InComponent->GpuIndirectArgsBuffer)
-		// Keep a raw (non-owning) pointer so CreateRenderThreadResources can write
-		// back the newly allocated buffer refs to the component.
 		, OwnerComponent(InComponent)
 	{
-		UMaterialInterface* ComponentMaterial = InComponent->GetMaterial();
-		const bool bValidMaterial = ComponentMaterial != nullptr &&
-			ComponentMaterial->CheckMaterialUsage_Concurrent(MATUSAGE_VirtualHeightfieldMesh);
-		Material = bValidMaterial
-			? ComponentMaterial->GetRenderProxy()
-			: UMaterial::GetDefaultMaterial(MD_Surface)->GetRenderProxy();
-		MaterialRelevance = Material->GetMaterialInterface()->GetRelevance_Concurrent(
-			GetScene().GetFeatureLevel());
-
-		if (InComponent->Mesh &&
-			InComponent->Mesh->GetRenderData() &&
-			InComponent->Mesh->GetRenderData()->LODResources.Num() > 0)
+		UStaticMesh* StaticMesh = InComponent->Mesh;
+		if (!StaticMesh || !StaticMesh->GetRenderData() ||
+			StaticMesh->GetRenderData()->LODResources.Num() == 0)
 		{
-			FStaticMeshLODResources& LOD = InComponent->Mesh->GetRenderData()->LODResources[0];
-			MeshVertexBuffers = &LOD.VertexBuffers;
-			MeshIndexBuffer   = &LOD.IndexBuffer;
-			MeshNumIndices    = LOD.IndexBuffer.GetNumIndices();
-			MeshNumTexCoords  = LOD.VertexBuffers.StaticMeshVertexBuffer.GetNumTexCoords();
+			return;
 		}
+
+		FStaticMeshLODResources& LOD = StaticMesh->GetRenderData()->LODResources[0];
+		MeshVertexBuffers = &LOD.VertexBuffers;
+		MeshIndexBuffer   = &LOD.IndexBuffer;
+		MeshNumTexCoords  = LOD.VertexBuffers.StaticMeshVertexBuffer.GetNumTexCoords();
+
+		// Build one section entry per LOD section, reading the material from
+		// the mesh's material slots — exactly what the editor assigns.
+		for (int32 SectionIdx = 0; SectionIdx < LOD.Sections.Num(); SectionIdx++)
+		{
+			const FStaticMeshSection& MeshSection = LOD.Sections[SectionIdx];
+
+			UMaterialInterface* Mat = StaticMesh->GetMaterial(MeshSection.MaterialIndex);
+			if (!Mat)
+				Mat = UMaterial::GetDefaultMaterial(MD_Surface);
+
+			FComputeDrivenSection& S = Sections.AddDefaulted_GetRef();
+			S.MaterialProxy     = Mat->GetRenderProxy();
+			S.MaterialRelevance = Mat->GetRelevance_Concurrent(GetScene().GetFeatureLevel());
+			S.FirstIndex       = MeshSection.FirstIndex;
+			S.NumIndices       = MeshSection.NumTriangles * 3;
+			S.MinVertexIndex   = MeshSection.MinVertexIndex;
+			S.MaxVertexIndex   = MeshSection.MaxVertexIndex;
+
+			// Accumulate material relevance across all sections
+			CombinedMaterialRelevance |= S.MaterialRelevance;
+		}
+
+		// Snapshot the per-section indirect arg buffers from the component.
+		// These are null until CreateRenderThreadResources — GetDynamicMeshElements guards.
+		ComponentIndirectArgsBuffers = InComponent->GpuIndirectArgsBuffers;
 	}
 
-	// -----------------------------------------------------------------------
 	virtual SIZE_T GetTypeHash() const override
 	{
 		static size_t UniquePointer;
@@ -80,54 +96,73 @@ public:
 	{
 		FPrimitiveSceneProxy::CreateRenderThreadResources(RHICmdList);
 
-		// Build vertex factory
 		FComputeDrivenInstancingParameters UniformParams;
 		VertexFactory = new FComputeDrivenInstancingVertexFactory(
 			GetScene().GetFeatureLevel(), UniformParams);
 
 		if (MeshVertexBuffers && MeshIndexBuffer)
-		{
 			VertexFactory->SetMeshBuffers(MeshVertexBuffers, MeshIndexBuffer);
-		}
+
 		VertexFactory->InitResource(RHICmdList);
 
-		// Allocate GPU buffers on the component so the compute shader can write to them.
-		// OwnerComponent pointer is safe here because CreateRenderThreadResources is called
-		// while the game thread is blocked (proxy creation fence).
-		if (OwnerComponent)
+		if (!OwnerComponent)
+			return;
+
+		// ---- Instance buffer (shared across all sections) ----
+		const uint32 InstanceStride     = 3 * sizeof(FVector4f); // MeshRenderInstance
+		const uint32 InstanceBufferSize = (uint32)OwnerComponent->MaxInstances * InstanceStride;
+
 		{
-			// MeshRenderInstance = 3 x float4 = 48 bytes per slot
-			const uint32 InstanceStride     = 3 * sizeof(FVector4f);
-			const uint32 InstanceBufferSize = (uint32)OwnerComponent->MaxInstances * InstanceStride;
+			FRHIResourceCreateInfo CI(TEXT("ComputeDriven.GpuInstanceBuffer"));
+			OwnerComponent->GpuInstanceBuffer = RHICmdList.CreateStructuredBuffer(
+				InstanceStride, InstanceBufferSize,
+				BUF_UnorderedAccess | BUF_ShaderResource,
+				ERHIAccess::SRVMask, CI);
+			OwnerComponent->GpuInstanceBufferUAV = RHICmdList.CreateUnorderedAccessView(
+				OwnerComponent->GpuInstanceBuffer, false, false);
+			OwnerComponent->GpuInstanceBufferSRV = RHICmdList.CreateShaderResourceView(
+				OwnerComponent->GpuInstanceBuffer);
+		}
 
-			{
-				FRHIResourceCreateInfo CI(TEXT("ComputeDriven.GpuInstanceBuffer"));
-				OwnerComponent->GpuInstanceBuffer = RHICmdList.CreateStructuredBuffer(
-					InstanceStride, InstanceBufferSize,
-					BUF_UnorderedAccess | BUF_ShaderResource,
-					ERHIAccess::SRVMask, CI);
-				OwnerComponent->GpuInstanceBufferUAV = RHICmdList.CreateUnorderedAccessView(
-					OwnerComponent->GpuInstanceBuffer, false, false);
-				OwnerComponent->GpuInstanceBufferSRV = RHICmdList.CreateShaderResourceView(
-					OwnerComponent->GpuInstanceBuffer);
-			}
+		// ---- One IndirectArgs buffer per section ----
+		// All sections draw the same instances, so InstanceCount is the same
+		// for every buffer. The compute shader writes to buffer[0] only.
+		// We copy InstanceCount from buffer[0] to the others before drawing.
+		OwnerComponent->GpuIndirectArgsBuffers.SetNum(Sections.Num());
+		OwnerComponent->GpuIndirectArgsBufferUAVs.SetNum(Sections.Num());
 
-			{
-				FRHIResourceCreateInfo CI(TEXT("ComputeDriven.GpuIndirectArgsBuffer"));
-				OwnerComponent->GpuIndirectArgsBuffer = RHICmdList.CreateVertexBuffer(
+		for (int32 SectionIdx = 0; SectionIdx < Sections.Num(); SectionIdx++)
+		{
+			const FComputeDrivenSection& S = Sections[SectionIdx];
+
+			// Pre-fill: [NumIndices, 0, FirstIndex, 0, 0]
+			TResourceArray<uint32, VERTEXBUFFER_ALIGNMENT> Args;
+			Args.Add(S.NumIndices);  // IndexCountPerInstance
+			Args.Add(0);             // InstanceCount — filled by compute shader
+			Args.Add(S.FirstIndex);  // StartIndexLocation
+			Args.Add(0);             // BaseVertexLocation
+			Args.Add(0);             // StartInstanceLocation
+
+			FRHIResourceCreateInfo CI(TEXT("ComputeDriven.GpuIndirectArgsBuffer"), &Args);
+			OwnerComponent->GpuIndirectArgsBuffers[SectionIdx] =
+				RHICmdList.CreateVertexBuffer(
 					5 * sizeof(uint32),
 					BUF_DrawIndirect | BUF_UnorderedAccess,
 					ERHIAccess::IndirectArgs, CI);
-				OwnerComponent->GpuIndirectArgsBufferUAV = RHICmdList.CreateUnorderedAccessView(
-					OwnerComponent->GpuIndirectArgsBuffer, PF_R32_UINT);
-			}
-
-			OwnerComponent->GpuMeshNumIndices = MeshNumIndices;
-
-			// Update our local cached SRV/buffer pointers from the freshly allocated refs.
-			ComponentInstanceBufferSRV  = OwnerComponent->GpuInstanceBufferSRV;
-			ComponentIndirectArgsBuffer = OwnerComponent->GpuIndirectArgsBuffer;
+			OwnerComponent->GpuIndirectArgsBufferUAVs[SectionIdx] =
+				RHICmdList.CreateUnorderedAccessView(
+					OwnerComponent->GpuIndirectArgsBuffers[SectionIdx], PF_R32_UINT);
 		}
+
+		// Total index count (used by RunComputeShader to check readiness)
+		int32 TotalIndices = 0;
+		for (const FComputeDrivenSection& S : Sections)
+			TotalIndices += (int32)S.NumIndices;
+		OwnerComponent->GpuMeshNumIndices = TotalIndices;
+
+		// Update local cached refs
+		ComponentInstanceBufferSRV   = OwnerComponent->GpuInstanceBufferSRV;
+		ComponentIndirectArgsBuffers = OwnerComponent->GpuIndirectArgsBuffers;
 	}
 
 	virtual void DestroyRenderThreadResources() override
@@ -139,10 +174,8 @@ public:
 			VertexFactory = nullptr;
 		}
 
-		// GPU buffers belong to the component — do NOT release them here.
-		// Just null out our cached pointers.
 		ComponentInstanceBufferSRV.SafeRelease();
-		ComponentIndirectArgsBuffer.SafeRelease();
+		ComponentIndirectArgsBuffers.Empty();
 	}
 
 	virtual void OnTransformChanged(FRHICommandListBase& RHICmdList) override {}
@@ -157,7 +190,7 @@ public:
 		Result.bRenderInMainPass     = ShouldRenderInMainPass();
 		Result.bUsesLightingChannels = GetLightingChannelMask() != GetDefaultLightingChannelMask();
 		Result.bRenderCustomDepth    = ShouldRenderCustomDepth();
-		MaterialRelevance.SetPrimitiveViewRelevance(Result);
+		CombinedMaterialRelevance.SetPrimitiveViewRelevance(Result);
 		return Result;
 	}
 
@@ -169,9 +202,8 @@ public:
 	{
 		check(IsInRenderingThread() || IsInParallelRenderingThread());
 
-		// Skip until the compute shader has run at least once.
-		if (!MeshIndexBuffer || MeshNumIndices == 0 ||
-			!ComponentInstanceBufferSRV || !ComponentIndirectArgsBuffer)
+		if (!MeshIndexBuffer || Sections.Num() == 0 || !ComponentInstanceBufferSRV ||
+			ComponentIndirectArgsBuffers.Num() != Sections.Num())
 		{
 			return;
 		}
@@ -181,62 +213,69 @@ public:
 			if (!(VisibilityMap & (1 << ViewIndex)))
 				continue;
 
-			FMeshBatch& Mesh = Collector.AllocateMesh();
-			Mesh.bWireframe                    = AllowDebugViewmodes() && ViewFamily.EngineShowFlags.Wireframe;
-			Mesh.bUseWireframeSelectionColoring = IsSelected();
-			Mesh.VertexFactory                 = VertexFactory;
-			Mesh.MaterialRenderProxy           = Material;
-			Mesh.ReverseCulling                = IsLocalToWorldDeterminantNegative();
-			Mesh.Type                          = PT_TriangleList;
-			Mesh.DepthPriorityGroup            = SDPG_World;
-			Mesh.bCanApplyViewModeOverrides    = true;
-			Mesh.bUseForMaterial               = true;
-			Mesh.CastShadow                    = true;
-			Mesh.bUseForDepthPass              = true;
+			// One FMeshBatch per section — each gets its own material and
+			// its own IndirectArgs buffer (with the correct FirstIndex baked in).
+			for (int32 SectionIdx = 0; SectionIdx < Sections.Num(); SectionIdx++)
+			{
+				const FComputeDrivenSection& S = Sections[SectionIdx];
 
-			FMeshBatchElement& BatchElement     = Mesh.Elements[0];
-			BatchElement.IndexBuffer            = MeshIndexBuffer;
-			BatchElement.IndirectArgsBuffer     = ComponentIndirectArgsBuffer; // GPU-filled
-			BatchElement.IndirectArgsOffset     = 0;
-			BatchElement.FirstIndex             = 0;
-			BatchElement.NumPrimitives          = 0; // ignored with IndirectArgsBuffer
-			BatchElement.MinVertexIndex         = 0;
-			BatchElement.MaxVertexIndex         = 0;
-			BatchElement.PrimitiveIdMode        = PrimID_ForceZero;
-			BatchElement.PrimitiveUniformBuffer = GetUniformBuffer();
+				if (!ComponentIndirectArgsBuffers[SectionIdx].IsValid())
+					continue;
 
-			FComputeDrivenInstancingUserData* UserData =
-				&Collector.AllocateOneFrameResource<FComputeDrivenInstancingUserData>();
-			BatchElement.UserData = UserData;
+				FMeshBatch& Mesh = Collector.AllocateMesh();
+				Mesh.bWireframe                    = AllowDebugViewmodes() && ViewFamily.EngineShowFlags.Wireframe;
+				Mesh.bUseWireframeSelectionColoring = IsSelected();
+				Mesh.VertexFactory                 = VertexFactory;
+				Mesh.MaterialRenderProxy           = S.MaterialProxy;
+				Mesh.ReverseCulling                = IsLocalToWorldDeterminantNegative();
+				Mesh.Type                          = PT_TriangleList;
+				Mesh.DepthPriorityGroup            = SDPG_World;
+				Mesh.bCanApplyViewModeOverrides    = true;
+				Mesh.bUseForMaterial               = true;
+				Mesh.CastShadow                    = true;
+				Mesh.bUseForDepthPass              = true;
 
-			UserData->InstanceBufferSRV = ComponentInstanceBufferSRV.GetReference(); // GPU-filled
-			UserData->PositionBufferSRV = VertexFactory->PositionBufferSRV.GetReference();
-			UserData->TangentBufferSRV  = VertexFactory->TangentBufferSRV.GetReference();
-			UserData->UV0BufferSRV      = VertexFactory->UV0BufferSRV.GetReference();
-			UserData->NumTexCoords      = MeshNumTexCoords;
-			UserData->LodViewOrigin     =
-				(FVector3f)ViewFamily.Views[0]->ViewMatrices.GetViewOrigin();
+				FMeshBatchElement& BatchElement     = Mesh.Elements[0];
+				BatchElement.IndexBuffer            = MeshIndexBuffer;
+				BatchElement.IndirectArgsBuffer     = ComponentIndirectArgsBuffers[SectionIdx];
+				BatchElement.IndirectArgsOffset     = 0;
+				BatchElement.FirstIndex             = 0; // StartIndex is baked into IndirectArgs
+				BatchElement.NumPrimitives          = 0; // ignored with IndirectArgsBuffer
+				BatchElement.MinVertexIndex         = S.MinVertexIndex;
+				BatchElement.MaxVertexIndex         = S.MaxVertexIndex;
+				BatchElement.PrimitiveIdMode        = PrimID_ForceZero;
+				BatchElement.PrimitiveUniformBuffer = GetUniformBuffer();
 
-			Collector.AddMesh(ViewIndex, Mesh);
+				FComputeDrivenInstancingUserData* UserData =
+					&Collector.AllocateOneFrameResource<FComputeDrivenInstancingUserData>();
+				BatchElement.UserData = UserData;
+
+				UserData->InstanceBufferSRV = ComponentInstanceBufferSRV.GetReference();
+				UserData->PositionBufferSRV = VertexFactory->PositionBufferSRV.GetReference();
+				UserData->TangentBufferSRV  = VertexFactory->TangentBufferSRV.GetReference();
+				UserData->UV0BufferSRV      = VertexFactory->UV0BufferSRV.GetReference();
+				UserData->NumTexCoords      = MeshNumTexCoords;
+				UserData->LodViewOrigin     =
+					(FVector3f)ViewFamily.Views[0]->ViewMatrices.GetViewOrigin();
+
+				Collector.AddMesh(ViewIndex, Mesh);
+			}
 		}
 	}
 
 private:
 	FComputeDrivenInstancingVertexFactory* VertexFactory;
-	FMaterialRenderProxy*                  Material;
-	FMaterialRelevance                     MaterialRelevance;
+	FMaterialRelevance                     CombinedMaterialRelevance;
 
-	const FRawStaticIndexBuffer*    MeshIndexBuffer   = nullptr; // not owned
-	const FStaticMeshVertexBuffers* MeshVertexBuffers = nullptr; // not owned
-	int32                           MeshNumIndices    = 0;
+	const FRawStaticIndexBuffer*    MeshIndexBuffer   = nullptr;
+	const FStaticMeshVertexBuffers* MeshVertexBuffers = nullptr;
 	uint32                          MeshNumTexCoords  = 1;
 
-	// Cached from component — valid after CreateRenderThreadResources.
-	FShaderResourceViewRHIRef ComponentInstanceBufferSRV;
-	FBufferRHIRef             ComponentIndirectArgsBuffer;
+	TArray<FComputeDrivenSection> Sections;
 
-	// Raw back-pointer used only in CreateRenderThreadResources to write
-	// newly allocated buffer refs back to the component.  Never used after that.
+	FShaderResourceViewRHIRef  ComponentInstanceBufferSRV;
+	TArray<FBufferRHIRef>      ComponentIndirectArgsBuffers;
+
 	UComputeDrivenIndirectInstancingComponent* OwnerComponent = nullptr;
 };
 
@@ -247,24 +286,19 @@ UComputeDrivenIndirectInstancingComponent::UComputeDrivenIndirectInstancingCompo
 	const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
 {
-	CastShadow                    = true;
-	bCastContactShadow            = true;
-	bUseAsOccluder                = true;
+	CastShadow                     = true;
+	bCastContactShadow             = true;
+	bUseAsOccluder                 = true;
 	bAffectDynamicIndirectLighting = true;
-	bAffectDistanceFieldLighting  = true;
-	bNeverDistanceCull            = true;
-	Mobility                      = EComponentMobility::Static;
+	bAffectDistanceFieldLighting   = true;
+	bNeverDistanceCull             = true;
+	Mobility                       = EComponentMobility::Static;
 }
 
 void UComputeDrivenIndirectInstancingComponent::OnRegister()
 {
 	Super::OnRegister();
 	SetMobility(EComponentMobility::Movable);
-
-	if (Material != nullptr)
-	{
-		Material->CheckMaterialUsage(MATUSAGE_VirtualHeightfieldMesh);
-	}
 }
 
 void UComputeDrivenIndirectInstancingComponent::OnUnregister()
@@ -282,17 +316,15 @@ void UComputeDrivenIndirectInstancingComponent::ApplyWorldOffset(
 FBoxSphereBounds UComputeDrivenIndirectInstancingComponent::CalcBounds(
 	const FTransform& LocalToWorld) const
 {
-	// Conservative world-space AABB based on camera ortho footprint.
-	// Adjust if your foliage placement area differs significantly.
 	const float HalfSize = 50000.f;
-	return FBoxSphereBounds(
-		FBox(FVector(-HalfSize), FVector(HalfSize))).TransformBy(LocalToWorld);
+	return FBoxSphereBounds(FBox(FVector(-HalfSize), FVector(HalfSize))).TransformBy(LocalToWorld);
 }
 
 FPrimitiveSceneProxy* UComputeDrivenIndirectInstancingComponent::CreateSceneProxy()
 {
 	if (!Mesh || !Mesh->GetRenderData() ||
-		Mesh->GetRenderData()->LODResources.Num() == 0)
+		Mesh->GetRenderData()->LODResources.Num() == 0 ||
+		Mesh->GetRenderData()->LODResources[0].Sections.Num() == 0)
 	{
 		return nullptr;
 	}
@@ -300,25 +332,36 @@ FPrimitiveSceneProxy* UComputeDrivenIndirectInstancingComponent::CreateSceneProx
 	return new FComputeDrivenIndirectInstancingSceneProxy(this);
 }
 
+UMaterialInterface* UComputeDrivenIndirectInstancingComponent::GetMaterial(int32 Index) const
+{
+	if (Mesh)
+		return Mesh->GetMaterial(Index);
+	return nullptr;
+}
+
 void UComputeDrivenIndirectInstancingComponent::SetMaterial(
 	int32 ElementIndex, UMaterialInterface* InMaterial)
 {
-	if (ElementIndex == 0 && Material != InMaterial)
-	{
-		Material = InMaterial;
-		if (Material != nullptr)
-		{
-			Material->CheckMaterialUsage(MATUSAGE_VirtualHeightfieldMesh);
-		}
-		MarkRenderStateDirty();
-	}
+	// Materials live on the mesh asset — override not supported.
 }
 
 void UComputeDrivenIndirectInstancingComponent::GetUsedMaterials(
 	TArray<UMaterialInterface*>& OutMaterials, bool bGetDebugMaterials) const
 {
-	if (Material != nullptr)
+	if (!Mesh || !Mesh->GetRenderData() ||
+		Mesh->GetRenderData()->LODResources.Num() == 0)
+		return;
+
+	const FStaticMeshLODResources& LOD = Mesh->GetRenderData()->LODResources[0];
+	for (const FStaticMeshSection& Section : LOD.Sections)
 	{
-		OutMaterials.Add(Material);
+		UMaterialInterface* Mat = Mesh->GetMaterial(Section.MaterialIndex);
+		if (Mat)
+			OutMaterials.AddUnique(Mat);
 	}
+}
+
+int32 UComputeDrivenIndirectInstancingComponent::GetNumMaterials() const
+{
+	return Mesh ? Mesh->GetStaticMaterials().Num() : 0;
 }

@@ -193,8 +193,9 @@ bool FComputeDrivenInstancingVertexFactory::ShouldCompilePermutation(
 	if (!IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5))
 		return false;
 
+	// Compile for any surface material or the engine default material,
+	// so ordinary foliage/landscape materials work without any special flag.
 	return Parameters.MaterialParameters.MaterialDomain == MD_Surface
-		&& Parameters.MaterialParameters.bIsUsedWithVirtualHeightfieldMesh
 		|| Parameters.MaterialParameters.bIsSpecialEngineMaterial;
 }
 
