@@ -22,8 +22,6 @@ void UComputeShaderMeshSpawner::BeginPlay()
 {
     Super::BeginPlay();
 
-    // Create the indirect instancing component on the same actor,
-    // exactly like the original code created UInstancedStaticMeshComponent.
     IndirectInstancingComponent = NewObject<UComputeDrivenIndirectInstancingComponent>(
         GetOwner(), TEXT("ComputeDrivenISMC"));
     IndirectInstancingComponent->RegisterComponent();
@@ -34,18 +32,21 @@ void UComputeShaderMeshSpawner::BeginPlay()
     IndirectInstancingComponent->MaxInstances = NumInstances;
 
     if (FoliageMesh)
-    {
         IndirectInstancingComponent->Mesh = FoliageMesh;
-    }
     if (FoliageMaterial)
-    {
         IndirectInstancingComponent->Material = FoliageMaterial;
-    }
 
     SetupDepthCapture();
     UpdateVoxelComponentList();
 
+    // Force a render frame so CreateRenderThreadResources fires and GPU buffers
+    // are allocated before we try to dispatch into them.
+    FlushRenderingCommands();
+
     CaptureDepth();
+
+    // Block until the capture is done then dispatch once synchronously.
+    FlushRenderingCommands();
     ExecuteComputeShader();
 }
 
@@ -96,14 +97,9 @@ void UComputeShaderMeshSpawner::CaptureDepth()
     SceneCaptureComponent->SetWorldRotation(CameraRotation);
     SceneCaptureComponent->OrthoWidth = OrthoWidth;
 
-    bCaptureInProgress = true;
-
-    AsyncTask(ENamedThreads::GameThread, [this]()
-    {
-        if (SceneCaptureComponent)
-            SceneCaptureComponent->CaptureScene();
-        bCaptureInProgress = false;
-    });
+    // CaptureScene() must be called on the game thread — it already is here,
+    // so call it directly instead of dispatching another AsyncTask.
+    SceneCaptureComponent->CaptureScene();
 }
 
 // ---------------------------------------------------------------------------
@@ -111,14 +107,11 @@ void UComputeShaderMeshSpawner::CaptureDepth()
 // ---------------------------------------------------------------------------
 void UComputeShaderMeshSpawner::RunComputeShader()
 {
-    if (!IndirectInstancingComponent)
-        return;
-
-    if (!DepthRenderTarget)
+    if (!IndirectInstancingComponent || !DepthRenderTarget)
         return;
 
     // GPU buffers are allocated by the scene proxy in CreateRenderThreadResources.
-    // They won't be valid until after the first render frame — guard here.
+    // Guard until they are ready.
     FBufferRHIRef              CapturedInstanceBuffer    = IndirectInstancingComponent->GpuInstanceBuffer;
     FUnorderedAccessViewRHIRef CapturedInstanceBufferUAV = IndirectInstancingComponent->GpuInstanceBufferUAV;
     FBufferRHIRef              CapturedIndirectBuffer    = IndirectInstancingComponent->GpuIndirectArgsBuffer;
@@ -134,6 +127,8 @@ void UComputeShaderMeshSpawner::RunComputeShader()
     }
 
     FTextureRHIRef CapturedDepthTexture = DepthRenderTarget->GetResource()->TextureRHI;
+    if (!CapturedDepthTexture.IsValid())
+        return;
 
     FRotationMatrix RotMatrix(CameraRotation);
     FVector3f CapturedCameraPos     = FVector3f(CameraLocation);
@@ -161,69 +156,57 @@ void UComputeShaderMeshSpawner::RunComputeShader()
          CapturedScaleMin, CapturedScaleMax]
         (FRHICommandListImmediate& RHICmdList)
         {
+            // ------------------------------------------------------------------
+            // Step 1 — reset IndirectArgs BEFORE opening the RDG graph.
+            // LockBuffer is a stalling CPU-write operation and must NOT be
+            // called inside an AddPass lambda (which runs inside Execute()).
+            // ------------------------------------------------------------------
+            RHICmdList.Transition(FRHITransitionInfo(
+                CapturedIndirectBufferUAV,
+                ERHIAccess::IndirectArgs,
+                ERHIAccess::UAVCompute));
+
+            uint32* Data = (uint32*)RHICmdList.LockBuffer(
+                CapturedIndirectBuffer, 0, 5 * sizeof(uint32), RLM_WriteOnly);
+            Data[0] = CapturedNumIndices; // IndexCountPerInstance — constant
+            Data[1] = 0;                  // InstanceCount — compute atomically increments this
+            Data[2] = 0;
+            Data[3] = 0;
+            Data[4] = 0;
+            RHICmdList.UnlockBuffer(CapturedIndirectBuffer);
+
+            // Transition instance buffer to UAV before the RDG graph too.
+            RHICmdList.Transition(FRHITransitionInfo(
+                CapturedInstanceBufferUAV,
+                ERHIAccess::SRVMask,
+                ERHIAccess::UAVCompute));
+
+            // ------------------------------------------------------------------
+            // Step 2 — RDG graph: dispatch the compute shader only.
+            // ------------------------------------------------------------------
             FRDGBuilder GraphBuilder(RHICmdList, RDG_EVENT_NAME("ComputeFoliageSpawn"));
 
-            // ------------------------------------------------------------------
-            // Pass 1 — reset IndirectArgs, write IndexCount into slot 0,
-            //           zero slot 1 (InstanceCount) so the atomic starts at 0.
-            // ------------------------------------------------------------------
-            AddPass(GraphBuilder,
-                RDG_EVENT_NAME("ClearIndirectArgs"),
-                [CapturedIndirectBuffer, CapturedIndirectBufferUAV, CapturedNumIndices]
-                (FRHICommandList& InRHICmdList)
-                {
-                    InRHICmdList.Transition(FRHITransitionInfo(
-                        CapturedIndirectBufferUAV,
-                        ERHIAccess::IndirectArgs,
-                        ERHIAccess::UAVCompute));
-
-                    uint32* Data = (uint32*)InRHICmdList.LockBuffer(
-                        CapturedIndirectBuffer, 0, 5 * sizeof(uint32), RLM_WriteOnly);
-                    Data[0] = CapturedNumIndices; // IndexCountPerInstance
-                    Data[1] = 0;                  // InstanceCount — incremented by compute
-                    Data[2] = 0;
-                    Data[3] = 0;
-                    Data[4] = 0;
-                    InRHICmdList.UnlockBuffer(CapturedIndirectBuffer);
-                });
-
-            // ------------------------------------------------------------------
-            // Pass 2 — transition instance buffer to UAV
-            // ------------------------------------------------------------------
-            AddPass(GraphBuilder,
-                RDG_EVENT_NAME("TransitionInstanceBufferToUAV"),
-                [CapturedInstanceBufferUAV](FRHICommandList& InRHICmdList)
-                {
-                    InRHICmdList.Transition(FRHITransitionInfo(
-                        CapturedInstanceBufferUAV,
-                        ERHIAccess::SRVMask,
-                        ERHIAccess::UAVCompute));
-                });
-
-            // ------------------------------------------------------------------
-            // Pass 3 — dispatch compute shader
-            // ------------------------------------------------------------------
             FInstancesComputeShader::FParameters* Parameters =
                 GraphBuilder.AllocParameters<FInstancesComputeShader::FParameters>();
 
-            Parameters->SpawnInstances       = CapturedInstanceBufferUAV;
-            Parameters->IndirectArgs         = CapturedIndirectBufferUAV;
-            Parameters->SceneDepthTexture    = CapturedDepthTexture;
-            Parameters->SceneDepthSampler    =
+            Parameters->SpawnInstances    = CapturedInstanceBufferUAV;
+            Parameters->IndirectArgs      = CapturedIndirectBufferUAV;
+            Parameters->SceneDepthTexture = CapturedDepthTexture;
+            Parameters->SceneDepthSampler =
                 TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
-            Parameters->CameraPosition       = CapturedCameraPos;
-            Parameters->CameraForward        = CapturedCameraForward;
-            Parameters->CameraRight          = CapturedCameraRight;
-            Parameters->CameraUp             = CapturedCameraUp;
-            Parameters->OrthoWidth           = CapturedOrthoWidth;
-            Parameters->OrthoHeight          = CapturedOrthoHeight;
-            Parameters->NumInstances         = CapturedNumInstances;
-            Parameters->MeshNumIndices       = CapturedNumIndices;
-            Parameters->GridCellSize         = CapturedGridCellSize;
-            Parameters->SpawnDensity         = CapturedSpawnDensity;
-            Parameters->VerticalOffset       = CapturedVertOffset;
-            Parameters->ScaleMin             = CapturedScaleMin;
-            Parameters->ScaleMax             = CapturedScaleMax;
+            Parameters->CameraPosition    = CapturedCameraPos;
+            Parameters->CameraForward     = CapturedCameraForward;
+            Parameters->CameraRight       = CapturedCameraRight;
+            Parameters->CameraUp          = CapturedCameraUp;
+            Parameters->OrthoWidth        = CapturedOrthoWidth;
+            Parameters->OrthoHeight       = CapturedOrthoHeight;
+            Parameters->NumInstances      = CapturedNumInstances;
+            Parameters->MeshNumIndices    = CapturedNumIndices;
+            Parameters->GridCellSize      = CapturedGridCellSize;
+            Parameters->SpawnDensity      = CapturedSpawnDensity;
+            Parameters->VerticalOffset    = CapturedVertOffset;
+            Parameters->ScaleMin          = CapturedScaleMin;
+            Parameters->ScaleMax          = CapturedScaleMax;
 
             TShaderMapRef<FInstancesComputeShader> ComputeShader(
                 GetGlobalShaderMap(GMaxRHIFeatureLevel));
@@ -237,32 +220,28 @@ void UComputeShaderMeshSpawner::RunComputeShader()
                 Parameters,
                 FIntVector(1, (int32)GroupsY, 1));
 
-            // ------------------------------------------------------------------
-            // Pass 4 — transition buffers back for draw
-            // ------------------------------------------------------------------
-            AddPass(GraphBuilder,
-                RDG_EVENT_NAME("TransitionBuffersToRead"),
-                [CapturedInstanceBufferUAV, CapturedIndirectBufferUAV]
-                (FRHICommandList& InRHICmdList)
-                {
-                    InRHICmdList.Transition(FRHITransitionInfo(
-                        CapturedInstanceBufferUAV,
-                        ERHIAccess::UAVCompute,
-                        ERHIAccess::SRVMask));
-
-                    InRHICmdList.Transition(FRHITransitionInfo(
-                        CapturedIndirectBufferUAV,
-                        ERHIAccess::UAVCompute,
-                        ERHIAccess::IndirectArgs));
-                });
-
             GraphBuilder.Execute();
+
+            // ------------------------------------------------------------------
+            // Step 3 — transition buffers back AFTER the graph has executed.
+            // ------------------------------------------------------------------
+            RHICmdList.Transition(FRHITransitionInfo(
+                CapturedInstanceBufferUAV,
+                ERHIAccess::UAVCompute,
+                ERHIAccess::SRVMask));
+
+            RHICmdList.Transition(FRHITransitionInfo(
+                CapturedIndirectBufferUAV,
+                ERHIAccess::UAVCompute,
+                ERHIAccess::IndirectArgs));
         }
     );
 
-    FlushRenderingCommands();
-
-    IndirectInstancingComponent->MarkRenderStateDirty();
+    // NOTE: No FlushRenderingCommands() here.
+    // On the tick path the game thread must not stall waiting for the render
+    // thread every frame — that's exactly what causes the hang.
+    // The render commands are fire-and-forget; the GPU draws whatever the most
+    // recently completed dispatch wrote.
 }
 
 void UComputeShaderMeshSpawner::ExecuteComputeShader()
@@ -278,7 +257,9 @@ void UComputeShaderMeshSpawner::TickComponent(float DeltaTime, ELevelTick TickTy
     if (bUpdateEveryFrame)
     {
         CaptureDepth();
-        ExecuteComputeShader();
+        RunComputeShader();
+        // No flush — enqueue and move on. The render thread processes it
+        // asynchronously without stalling the game thread.
     }
 }
 
