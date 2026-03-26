@@ -1,106 +1,185 @@
+// Depth-driven foliage spawner.
+// Reads an orthographic top-down depth capture and writes one MeshRenderInstance
+// (3 x float4 column-major TRS matrix) per grid cell directly into the GPU buffer
+// that the indirect vertex factory reads — no CPU round-trip.
+//
+// Key design: all randomness (jitter, yaw, scale, spawn probability) is seeded
+// from the WORLD-SPACE grid cell coordinate, not the screen-space index.
+// This means every unique world location always produces the same instance,
+// so instances are anchored to the ground as the camera moves.
+
 #include "/Engine/Public/Platform.ush"
 
-RWStructuredBuffer<float4> SpawnPositions;
+// ---- MeshRenderInstance struct must match ComputeDrivenInstancingVertexFactory.ush ----
+struct MeshRenderInstance
+{
+    float4 InstanceToWorld0;  // column 0  (X axis + Tx)
+    float4 InstanceToWorld1;  // column 1  (Y axis + Ty)
+    float4 InstanceToWorld2;  // column 2  (Z axis + Tz)
+};
+
+// ---- Outputs ---------------------------------------------------------------
+RWStructuredBuffer<MeshRenderInstance> SpawnInstances;
+RWBuffer<uint>                         IndirectArgs;
+
+// ---- Inputs ----------------------------------------------------------------
 Texture2D<float> SceneDepthTexture;
-SamplerState SceneDepthSampler;
+SamplerState     SceneDepthSampler;
 
 float3 CameraPosition;
 float3 CameraForward;
 float3 CameraRight;
 float3 CameraUp;
-float OrthoWidth;
-float OrthoHeight;
-uint NumInstances;
-float GridCellSize;
-float SpawnDensity;
-float VerticalOffset;
+float  OrthoWidth;
+float  OrthoHeight;
+uint   NumInstances;
+uint   MeshNumIndices;
+float  GridCellSize;
+float  SpawnDensity;
+float  VerticalOffset;
+float  ScaleMin;
+float  ScaleMax;
 
+// ---- Helpers ---------------------------------------------------------------
+
+// Hash seeded from a world-space integer cell coordinate.
+// Same world cell → same value, regardless of camera position.
 float Hash2D(float2 p)
 {
     return frac(sin(dot(p, float2(127.1, 311.7))) * 43758.5453123);
 }
 
+MeshRenderInstance BuildInstance(float3 worldPos, float yawRad, float scale)
+{
+    float s = sin(yawRad);
+    float c = cos(yawRad);
+
+    MeshRenderInstance Inst;
+    Inst.InstanceToWorld0 = float4( scale * c, scale * s, 0.0f, worldPos.x);
+    Inst.InstanceToWorld1 = float4(-scale * s, scale * c, 0.0f, worldPos.y);
+    Inst.InstanceToWorld2 = float4( 0.0f,      0.0f,      scale, worldPos.z);
+    return Inst;
+}
+
+MeshRenderInstance NullInstance()
+{
+    MeshRenderInstance Inst;
+    Inst.InstanceToWorld0 = float4(0, 0, 0, 0);
+    Inst.InstanceToWorld1 = float4(0, 0, 0, 0);
+    Inst.InstanceToWorld2 = float4(0, 0, 0, 0);
+    return Inst;
+}
+
+// ---- Main ------------------------------------------------------------------
 [numthreads(10, 100, 1)]
 void MainCS(uint3 ThreadId : SV_DispatchThreadID)
 {
-    uint Width =10;
-    uint X = ThreadId.x; // Column
-    uint Y = ThreadId.y; // Row
-    uint Index = Y * Width + X;
-    
+    const uint TileWidth = 10;
+    uint Index = ThreadId.y * TileWidth + ThreadId.x;
+
     if (Index >= NumInstances)
         return;
-    
-    // Calculate grid position
-    uint GridWidth = (uint)sqrt((float)NumInstances);
-    uint GridHeight = GridWidth;
-    
-    uint GridX = Index % GridWidth;
-    uint GridY = Index / GridWidth;
-    
-    // Calculate base UV coordinates
-    float2 uv;
-    uv.x = ((float)GridX + 0.5) / (float)GridWidth;
-    uv.y = ((float)GridY + 0.5) / (float)GridHeight;
-    
-    // Apply jitter for randomization
-    float2 gridSeed = float2((float)GridX, (float)GridY);
-    float jitterX = (Hash2D(gridSeed) - 0.5) / (float)GridWidth;
-    float jitterY = (Hash2D(gridSeed + float2(42.0, 13.0)) - 0.5) / (float)GridHeight;
-    
-    uv.x += jitterX;
-    uv.y += jitterY;
-    uv = saturate(uv);
-    
-    // Sample depth directly from texture
-    float depth = SceneDepthTexture.SampleLevel(SceneDepthSampler, uv, 0);
-    
-    // Convert UV to NDC space
+
+    // -------------------------------------------------------------------------
+    // Step 1 — compute the world-space position of this grid cell's CENTER.
+    //
+    // We snap the camera's XY to the grid so the cell layout is stable as the
+    // camera moves.  Each cell covers GridCellSize x GridCellSize world units.
+    // -------------------------------------------------------------------------
+    uint GridSide = (uint)sqrt((float)NumInstances);
+
+    uint GridX = Index % GridSide;
+    uint GridY = Index / GridSide;
+
+    // Snap camera origin to grid, then offset to cell center.
+    // floor(x / cellSize) * cellSize gives the bottom-left corner of the
+    // cell the camera is currently in.  We offset from there by the integer
+    // cell index so every cell covers a unique, fixed world region.
+    float2 cameraSnapped;
+    cameraSnapped.x = floor(CameraPosition.x / GridCellSize) * GridCellSize;
+    cameraSnapped.y = floor(CameraPosition.y / GridCellSize) * GridCellSize;
+
+    // Integer offset from snapped origin: centre the grid around the camera.
+    int halfGrid = (int)GridSide / 2;
+    float2 cellCenter;
+    cellCenter.x = cameraSnapped.x + ((float)((int)GridX - halfGrid) + 0.5f) * GridCellSize;
+    cellCenter.y = cameraSnapped.y + ((float)((int)GridY - halfGrid) + 0.5f) * GridCellSize;
+
+    // -------------------------------------------------------------------------
+    // Step 2 — seed ALL randomness from the world-space cell coordinate.
+    //
+    // Round to nearest cell so floating-point drift doesn't change the seed
+    // for the same cell across frames.
+    // -------------------------------------------------------------------------
+    float2 worldSeed = round(cellCenter / GridCellSize);  // integer cell ID in world space
+
+    // -------------------------------------------------------------------------
+    // Step 3 — spawn probability (world-anchored).
+    // -------------------------------------------------------------------------
+    float spawnRandom = Hash2D(worldSeed + float2(100.0f, 200.0f));
+    if (spawnRandom >= SpawnDensity)
+    {
+        SpawnInstances[Index] = NullInstance();
+        return;
+    }
+
+    // -------------------------------------------------------------------------
+    // Step 4 — jitter within cell (world-anchored, sub-cell offset).
+    // -------------------------------------------------------------------------
+    float jitterX = (Hash2D(worldSeed + float2(1.0f, 2.0f)) - 0.5f) * GridCellSize;
+    float jitterY = (Hash2D(worldSeed + float2(3.0f, 4.0f)) - 0.5f) * GridCellSize;
+
+    float2 worldXY = cellCenter + float2(jitterX, jitterY);
+
+    // -------------------------------------------------------------------------
+    // Step 5 — map world XY back to a UV for depth sampling.
+    // -------------------------------------------------------------------------
+    // Project worldXY onto the camera's right/up axes to get NDC.
+    float2 camOffset;
+    camOffset.x = dot(float3(worldXY - CameraPosition.xy, 0.0f), CameraRight);
+    camOffset.y = dot(float3(worldXY - CameraPosition.xy, 0.0f), CameraUp);
+
     float2 ndc;
-    ndc.x = uv.x * 2.0 - 1.0;
-    ndc.y = (1.0 - uv.y) * 2.0 - 1.0;
-    
-    // Calculate world position directly using orthographic projection
-    float3 worldPosition = CameraPosition 
-                         + (ndc.x * OrthoWidth * 0.5 * CameraRight) 
-                         + (ndc.y * OrthoHeight * 0.5 * CameraUp)
-                         + (depth * CameraForward);
-    
-    // Check if we hit valid geometry AND it's the target mesh
-    bool didHit = depth > 0.0 ;
-    
-    if (!didHit)
+    ndc.x =  camOffset.x / (OrthoWidth  * 0.5f);
+    ndc.y =  camOffset.y / (OrthoHeight * 0.5f);
+
+    // Clamp — skip cells outside the capture footprint this frame.
+    if (any(abs(ndc) > 1.0f))
     {
-        // No valid surface or wrong mesh - place far away
-        worldPosition = float3(0, 0, 0);
+        SpawnInstances[Index] = NullInstance();
+        return;
     }
-    else
+
+    float2 uv;
+    uv.x =  ndc.x * 0.5f + 0.5f;
+    uv.y = -ndc.y * 0.5f + 0.5f;  // V is flipped relative to Y
+
+    // -------------------------------------------------------------------------
+    // Step 6 — sample depth and reconstruct world Z.
+    // -------------------------------------------------------------------------
+    float depth = SceneDepthTexture.SampleLevel(SceneDepthSampler, uv, 0);
+
+    if (depth <= 0.0f)
     {
-        // Apply spawn probability
-        float spawnRandom = Hash2D(gridSeed + float2(100.0, 200.0));
-        bool shouldSpawn = spawnRandom < SpawnDensity;
-        
-        if (shouldSpawn)
-        {
-            // Add vertical offset (adjust based on your up axis)
-            worldPosition += VerticalOffset * float3(0, 0, 1); // Z-up
-            
-            // Add random positional offset within grid cell
-            float offsetX = (Hash2D(gridSeed + float2(1.0, 2.0)) - 0.5) * GridCellSize;
-            float offsetY = (Hash2D(gridSeed + float2(3.0, 4.0)) - 0.5) * GridCellSize;
-            
-            worldPosition.x += offsetX;
-            worldPosition.y += offsetY;
-        }
-        else
-        {
-            worldPosition = float3(0, 0, 0);
-        }
+        SpawnInstances[Index] = NullInstance();
+        return;
     }
-    
-    // Calculate random scale variation
-    float scaleVariation = 0.7 + Hash2D(gridSeed + float2(7.0, 8.0)) * 0.6;
-    
-    // Write result
-    SpawnPositions[Index] = float4(worldPosition, scaleVariation);
+
+    float worldZ = CameraPosition.z + depth * CameraForward.z + VerticalOffset;
+
+    float3 worldPosition = float3(worldXY, worldZ);
+
+    // -------------------------------------------------------------------------
+    // Step 7 — random yaw and scale (world-anchored).
+    // -------------------------------------------------------------------------
+    float yaw   = Hash2D(worldSeed + float2(5.0f, 6.0f)) * 6.28318530718f;
+    float scale = ScaleMin + Hash2D(worldSeed + float2(7.0f, 8.0f)) * (ScaleMax - ScaleMin);
+
+    // -------------------------------------------------------------------------
+    // Step 8 — write instance and increment draw counter.
+    // -------------------------------------------------------------------------
+    SpawnInstances[Index] = BuildInstance(worldPosition, yaw, scale);
+
+    uint dummy;
+    InterlockedAdd(IndirectArgs[1], 1u, dummy);
 }
