@@ -23,84 +23,95 @@ float Hash2D(float2 p)
 [numthreads(10, 100, 1)]
 void MainCS(uint3 ThreadId : SV_DispatchThreadID)
 {
-    uint Width =10;
+    uint Width = 10;
     uint X = ThreadId.x; // Column
     uint Y = ThreadId.y; // Row
     uint Index = Y * Width + X;
-    
+
     if (Index >= NumInstances)
         return;
-    
-    // Calculate grid position
+
     uint GridWidth = (uint)sqrt((float)NumInstances);
     uint GridHeight = GridWidth;
-    
+
     uint GridX = Index % GridWidth;
     uint GridY = Index / GridWidth;
-    
-    // Calculate base UV coordinates
+
+    // --- World-space snapped grid origin ---
+    // Snap the camera's XY position to the nearest GridCellSize boundary so the
+    // grid is fixed in world space. The grid origin shifts only in discrete
+    // cell-sized steps, never continuously with the camera.
+    float totalGridWidth  = GridCellSize * (float)GridWidth;
+    float totalGridHeight = GridCellSize * (float)GridHeight;
+
+    float snappedOriginX = floor(CameraPosition.x / GridCellSize) * GridCellSize - totalGridWidth  * 0.5;
+    float snappedOriginY = floor(CameraPosition.y / GridCellSize) * GridCellSize - totalGridHeight * 0.5;
+
+    // World-space XY centre of this cell
+    float worldX = snappedOriginX + ((float)GridX + 0.5) * GridCellSize;
+    float worldY = snappedOriginY + ((float)GridY + 0.5) * GridCellSize;
+
+    // Use the stable world-cell coordinates as the hash seed so jitter and
+    // spawn probability are permanently bound to each world cell, not to the
+    // thread index. Divide by GridCellSize so neighbouring cells always
+    // produce different seeds regardless of scale.
+    float2 gridSeed = float2(worldX, worldY) / GridCellSize;
+
+    // Per-cell sub-jitter (stays < half a cell so cells never overlap)
+    float jitterX = (Hash2D(gridSeed)                        - 0.5) * GridCellSize * 0.9;
+    float jitterY = (Hash2D(gridSeed + float2(42.0, 13.0))   - 0.5) * GridCellSize * 0.9;
+
+    float sampleWorldX = worldX + jitterX;
+    float sampleWorldY = worldY + jitterY;
+
+    // Project the world-XY sample point back into the depth texture.
+    // The capture camera is orthographic looking straight down, so the offset
+    // from the camera centre maps linearly to UV.
+    float2 camOffset;
+    camOffset.x = dot(float3(sampleWorldX - CameraPosition.x, sampleWorldY - CameraPosition.y, 0.0), CameraRight);
+    camOffset.y = dot(float3(sampleWorldX - CameraPosition.x, sampleWorldY - CameraPosition.y, 0.0), CameraUp);
+
     float2 uv;
-    uv.x = ((float)GridX + 0.5) / (float)GridWidth;
-    uv.y = ((float)GridY + 0.5) / (float)GridHeight;
-    
-    // Apply jitter for randomization
-    float2 gridSeed = float2((float)GridX, (float)GridY);
-    float jitterX = (Hash2D(gridSeed) - 0.5) / (float)GridWidth;
-    float jitterY = (Hash2D(gridSeed + float2(42.0, 13.0)) - 0.5) / (float)GridHeight;
-    
-    uv.x += jitterX;
-    uv.y += jitterY;
+    uv.x =  camOffset.x / OrthoWidth  + 0.5;
+    uv.y = -camOffset.y / OrthoHeight + 0.5;   // V is flipped in UE render targets
     uv = saturate(uv);
-    
-    // Sample depth directly from texture
+
+    // Sample depth
     float depth = SceneDepthTexture.SampleLevel(SceneDepthSampler, uv, 0);
-    
-    // Convert UV to NDC space
-    float2 ndc;
-    ndc.x = uv.x * 2.0 - 1.0;
-    ndc.y = (1.0 - uv.y) * 2.0 - 1.0;
-    
-    // Calculate world position directly using orthographic projection
-    float3 worldPosition = CameraPosition 
-                         + (ndc.x * OrthoWidth * 0.5 * CameraRight) 
-                         + (ndc.y * OrthoHeight * 0.5 * CameraUp)
-                         + (depth * CameraForward);
-    
-    // Check if we hit valid geometry AND it's the target mesh
-    bool didHit = depth > 0.0 ;
-    
+
+    bool didHit = depth > 0.0;
+
+    float4 result;
+
     if (!didHit)
     {
-        // No valid surface or wrong mesh - place far away
-        worldPosition = float3(0, 0, 0);
+        result = float4(0, 0, 0, 0);
     }
     else
     {
-        // Apply spawn probability
+        // Apply spawn probability - keyed on world cell so it never flickers
         float spawnRandom = Hash2D(gridSeed + float2(100.0, 200.0));
-        bool shouldSpawn = spawnRandom < SpawnDensity;
-        
+        bool shouldSpawn  = spawnRandom < SpawnDensity;
+
         if (shouldSpawn)
         {
-            // Add vertical offset (adjust based on your up axis)
-            worldPosition += VerticalOffset * float3(0, 0, 1); // Z-up
-            
-            // Add random positional offset within grid cell
-            float offsetX = (Hash2D(gridSeed + float2(1.0, 2.0)) - 0.5) * GridCellSize;
-            float offsetY = (Hash2D(gridSeed + float2(3.0, 4.0)) - 0.5) * GridCellSize;
-            
-            worldPosition.x += offsetX;
-            worldPosition.y += offsetY;
+            // Reconstruct world Z from the depth sample using the camera ray
+            float3 worldPosition = CameraPosition
+                                 + (camOffset.x * CameraRight)
+                                 + (camOffset.y * CameraUp)
+                                 + (depth * CameraForward);
+
+            // Apply vertical offset along world Z
+            worldPosition.z += VerticalOffset;
+
+            float scaleVariation = 0.7 + Hash2D(gridSeed + float2(7.0, 8.0)) * 0.6;
+            result = float4(worldPosition, scaleVariation);
         }
         else
         {
-            worldPosition = float3(0, 0, 0);
+            result = float4(0, 0, 0, 0);
         }
     }
-    
-    // Calculate random scale variation
-    float scaleVariation = 0.7 + Hash2D(gridSeed + float2(7.0, 8.0)) * 0.6;
-    
-    // Write result
-    SpawnPositions[Index] = float4(worldPosition, scaleVariation);
+
+    SpawnPositions[Index] = result;
 }
