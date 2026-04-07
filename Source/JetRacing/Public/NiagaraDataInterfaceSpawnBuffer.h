@@ -15,7 +15,7 @@ class UComputeShaderMeshSpawner;
 // Shader parameter struct
 // ─────────────────────────────────────────────────────────────────────────────
 BEGIN_SHADER_PARAMETER_STRUCT(FSpawnBufferShaderParameters, )
-    SHADER_PARAMETER(int32,                        NumInstances)
+    SHADER_PARAMETER(int32,           NumInstances)
     SHADER_PARAMETER_SRV(StructuredBuffer<float4>, SpawnPositions)
 END_SHADER_PARAMETER_STRUCT()
 
@@ -37,10 +37,17 @@ struct FSpawnBufferProxy : public FNiagaraDataInterfaceProxy
         if (DummySRV.IsValid())
             return;
 
-        FRHIResourceCreateInfo Info(TEXT("SpawnBufferDummy"));
+        // One zero-filled element. BulkData must outlive CreateBuffer so we
+        // keep it on the stack — CreateBuffer copies it synchronously.
+        FVector4f ZeroElement(0.f, 0.f, 0.f, 0.f);
+        TResourceArray<FVector4f, VERTEXBUFFER_ALIGNMENT> InitData;
+        InitData.Add(ZeroElement);
+
+        FRHIResourceCreateInfo Info(TEXT("SpawnBufferDummy"), &InitData);
+
         DummyBuffer = RHICmdList.CreateBuffer(
             sizeof(FVector4f),
-            BUF_ShaderResource | BUF_StructuredBuffer,
+            BUF_ShaderResource | BUF_StructuredBuffer | BUF_Static,
             sizeof(FVector4f),
             ERHIAccess::SRVMask,
             Info);

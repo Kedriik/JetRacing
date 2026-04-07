@@ -161,7 +161,10 @@ void UNiagaraDataInterfaceSpawnBuffer::SetShaderParameters(
     FSpawnBufferShaderParameters* Params =
         Context.GetParameterNestedStruct<FSpawnBufferShaderParameters>();
     if (!Params)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("SpawnBufferDI: SetShaderParameters called but Params is null"));
         return;
+    }
 
     FSpawnBufferProxy& DIProxy = Context.GetProxy<FSpawnBufferProxy>();
 
@@ -179,6 +182,9 @@ void UNiagaraDataInterfaceSpawnBuffer::SetShaderParameters(
 
     Params->NumInstances   = DIProxy.SpawnPositionsSRV.IsValid() ? DIProxy.NumInstances : 0;
     Params->SpawnPositions = SafeSRV;
+    // Uncomment to debug binding each frame:
+    // UE_LOG(LogTemp, Log, TEXT("SpawnBufferDI: Bound SRV, NumInstances=%d, RealSRV=%d"),
+    //     Params->NumInstances, DIProxy.SpawnPositionsSRV.IsValid() ? 1 : 0);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
