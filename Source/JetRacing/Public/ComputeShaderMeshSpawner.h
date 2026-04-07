@@ -2,7 +2,6 @@
 
 #include "CoreMinimal.h"
 #include "Components/ActorComponent.h"
-#include "Components/InstancedStaticMeshComponent.h"
 #include "Components/SceneCaptureComponent2D.h"
 #include "Engine/TextureRenderTarget2D.h"
 #include "RHI.h"
@@ -18,8 +17,7 @@ class JETRACING_API UComputeShaderMeshSpawner : public UActorComponent
 public:
     UComputeShaderMeshSpawner();
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawning")
-    TObjectPtr<UStaticMesh> FoliageMesh;
+    // ── Designer properties (unchanged) ──────────────────────────────────────
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Capture")
     TObjectPtr<UTextureRenderTarget2D> DepthRenderTarget;
@@ -46,10 +44,12 @@ public:
     float OrthoWidth = 10000.0f;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Capture")
-    TObjectPtr<UPrimitiveComponent> VoxelWorldActor;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Capture")
     FName VoxelMeshComponentTag = FName("VoxelMesh");
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawning")
+    bool bUpdateEveryFrame = false;
+
+    // ── Blueprint API (unchanged) ─────────────────────────────────────────────
 
     UFUNCTION(BlueprintCallable, Category = "Spawning")
     void RegisterVoxelMeshComponent(UPrimitiveComponent* Component);
@@ -57,14 +57,20 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Spawning")
     void UnregisterVoxelMeshComponent(UPrimitiveComponent* Component);
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawning")
-    bool bUpdateEveryFrame = false;
-
     UFUNCTION(BlueprintCallable, Category = "Spawning")
     void ExecuteComputeShader();
 
     UFUNCTION(BlueprintCallable, Category = "Spawning")
     void CaptureDepth();
+
+    // ── Accessors for the Niagara Data Interface ──────────────────────────────
+    // Safe to call from the game thread; the SRV is created once in CreateBuffers
+    // and lives until ReleaseBuffers, so the DI can cache the pointer each frame.
+
+    FORCEINLINE FShaderResourceViewRHIRef GetPositionBufferSRV() const { return PositionBufferSRV; }
+    FORCEINLINE int32                     GetNumInstances()      const { return NumInstances; }
+
+    // ── Component lifecycle ───────────────────────────────────────────────────
 
     virtual void BeginPlay() override;
     virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
@@ -72,19 +78,18 @@ public:
 
 private:
     UPROPERTY()
-    TObjectPtr<UInstancedStaticMeshComponent> InstancedMeshComponent;
-
-    UPROPERTY()
     TObjectPtr<USceneCaptureComponent2D> SceneCaptureComponent;
 
-    FBufferRHIRef PositionBuffer;
-    FUnorderedAccessViewRHIRef PositionBufferUAV;
+    // GPU buffer – written by compute shader, read by Niagara via SRV
+    FBufferRHIRef                  PositionBuffer;
+    FUnorderedAccessViewRHIRef     PositionBufferUAV;  // compute shader writes via this
+    FShaderResourceViewRHIRef      PositionBufferSRV;  // Niagara reads via this
+
     bool bCaptureInProgress = false;
-    
+
     void CreateBuffers();
     void ReleaseBuffers();
     void RunComputeShader();
-    void UpdateMeshInstances();
     void SetupDepthCapture();
     void UpdateVoxelComponentList();
 };

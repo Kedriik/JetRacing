@@ -18,18 +18,9 @@ void UComputeShaderMeshSpawner::BeginPlay()
 {
     Super::BeginPlay();
 
-    InstancedMeshComponent = NewObject<UInstancedStaticMeshComponent>(GetOwner(), TEXT("ComputeShaderISMC"));
-    InstancedMeshComponent->RegisterComponent();
-    InstancedMeshComponent->AttachToComponent(GetOwner()->GetRootComponent(), FAttachmentTransformRules::KeepRelativeTransform);
-    
-    if (FoliageMesh)
-    {
-        InstancedMeshComponent->SetStaticMesh(FoliageMesh);
-    }
-
     SetupDepthCapture();
     CreateBuffers();
-    
+
     CaptureDepth();
     ExecuteComputeShader();
 }
@@ -39,6 +30,10 @@ void UComputeShaderMeshSpawner::EndPlay(const EEndPlayReason::Type EndPlayReason
     Super::EndPlay(EndPlayReason);
     ReleaseBuffers();
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Depth capture (unchanged from original)
+// ─────────────────────────────────────────────────────────────────────────────
 
 void UComputeShaderMeshSpawner::SetupDepthCapture()
 {
@@ -50,65 +45,26 @@ void UComputeShaderMeshSpawner::SetupDepthCapture()
         DepthRenderTarget->UpdateResourceImmediate(true);
     }
 
-   
-    // DEPTH CAPTURE COMPONENT
     SceneCaptureComponent = NewObject<USceneCaptureComponent2D>(GetOwner(), TEXT("DepthCaptureComp"));
     SceneCaptureComponent->RegisterComponent();
-    SceneCaptureComponent->AttachToComponent(GetOwner()->GetRootComponent(), FAttachmentTransformRules::KeepRelativeTransform);
+    SceneCaptureComponent->AttachToComponent(GetOwner()->GetRootComponent(),
+                                              FAttachmentTransformRules::KeepRelativeTransform);
 
     SceneCaptureComponent->PrimitiveRenderMode = ESceneCapturePrimitiveRenderMode::PRM_UseShowOnlyList;
-    
-    SceneCaptureComponent->TextureTarget = DepthRenderTarget;
-    SceneCaptureComponent->CaptureSource = SCS_SceneDepth;
-    SceneCaptureComponent->bCaptureEveryFrame = false;
-    SceneCaptureComponent->bCaptureOnMovement = false;
+    SceneCaptureComponent->TextureTarget       = DepthRenderTarget;
+    SceneCaptureComponent->CaptureSource       = SCS_SceneDepth;
+    SceneCaptureComponent->bCaptureEveryFrame  = false;
+    SceneCaptureComponent->bCaptureOnMovement  = false;
 
-    // CRITICAL: Disable ALL unnecessary rendering features
-   /* SceneCaptureComponent->ShowFlags.SetAntiAliasing(false);
-    SceneCaptureComponent->ShowFlags.SetAtmosphere(false);
-    SceneCaptureComponent->ShowFlags.SetFog(false);
-    SceneCaptureComponent->ShowFlags.SetVolumetricFog(false);
-    SceneCaptureComponent->ShowFlags.SetMotionBlur(false);
-    SceneCaptureComponent->ShowFlags.SetBloom(false);
-    SceneCaptureComponent->ShowFlags.SetAmbientOcclusion(false);
-    SceneCaptureComponent->ShowFlags.SetDynamicShadows(false);
-    SceneCaptureComponent->ShowFlags.SetContactShadows(false);
-    SceneCaptureComponent->ShowFlags.SetDirectionalLights(false);
-    SceneCaptureComponent->ShowFlags.SetPointLights(false);
-    SceneCaptureComponent->ShowFlags.SetSpotLights(false);
-    SceneCaptureComponent->ShowFlags.SetRectLights(false);
-    SceneCaptureComponent->ShowFlags.SetSkyLighting(false);
-    SceneCaptureComponent->ShowFlags.SetIndirectLightingCache(false);
-    SceneCaptureComponent->ShowFlags.SetReflectionEnvironment(false);
-    SceneCaptureComponent->ShowFlags.SetScreenSpaceReflections(false);
-    SceneCaptureComponent->ShowFlags.SetTexturedLightProfiles(false);
-    SceneCaptureComponent->ShowFlags.SetAmbientCubemap(false);
-    SceneCaptureComponent->ShowFlags.SetDistanceFieldAO(false);
-    SceneCaptureComponent->ShowFlags.SetLightFunctions(false);
-    SceneCaptureComponent->ShowFlags.SetLightShafts(false);
-    SceneCaptureComponent->ShowFlags.SetPostProcessing(false);
-    SceneCaptureComponent->ShowFlags.SetTranslucency(false);
-    SceneCaptureComponent->ShowFlags.SetScreenPercentage(false);
-    SceneCaptureComponent->ShowFlags.SetTemporalAA(false);
-    SceneCaptureComponent->ShowFlags.SetGlobalIllumination(false);
-    SceneCaptureComponent->ShowFlags.SetDiffuse(false);
-    SceneCaptureComponent->ShowFlags.SetSpecular(false);
-    */
-    
     SceneCaptureComponent->SetWorldLocation(CameraLocation);
     SceneCaptureComponent->SetWorldRotation(CameraRotation);
-    
     SceneCaptureComponent->ProjectionType = ECameraProjectionMode::Orthographic;
-    SceneCaptureComponent->OrthoWidth = OrthoWidth;
-    
+    SceneCaptureComponent->OrthoWidth     = OrthoWidth;
 }
 
 void UComputeShaderMeshSpawner::CaptureDepth()
 {
-    if (bCaptureInProgress)
-        return; // Skip if previous capture still in progress
-
-    if (!SceneCaptureComponent)
+    if (bCaptureInProgress || !SceneCaptureComponent)
         return;
 
     SceneCaptureComponent->ShowOnlyComponents.Remove(nullptr);
@@ -118,178 +74,149 @@ void UComputeShaderMeshSpawner::CaptureDepth()
 
     bCaptureInProgress = true;
 
-    // Capture async
     AsyncTask(ENamedThreads::GameThread, [this]()
-        {
-            if (SceneCaptureComponent)
-            {
-                SceneCaptureComponent->CaptureScene();
-            }
-            bCaptureInProgress = false;
-        });
+    {
+        if (SceneCaptureComponent)
+            SceneCaptureComponent->CaptureScene();
+        bCaptureInProgress = false;
+    });
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Buffer management – now also creates an SRV for Niagara
+// ─────────────────────────────────────────────────────────────────────────────
 
 void UComputeShaderMeshSpawner::CreateBuffers()
 {
     if (NumInstances <= 0)
         return;
 
-    const uint32 BufferSize = sizeof(FVector4f) * NumInstances;
+    const uint32 BufferSize   = sizeof(FVector4f) * NumInstances;
     const uint32 BufferStride = sizeof(FVector4f);
 
+    // Capture member pointers so the lambda can write back results
+    FBufferRHIRef*              OutBuffer    = &PositionBuffer;
+    FUnorderedAccessViewRHIRef* OutUAV       = &PositionBufferUAV;
+    FShaderResourceViewRHIRef*  OutSRV       = &PositionBufferSRV;
+
     ENQUEUE_RENDER_COMMAND(CreatePositionBuffer)(
-        [this, BufferStride, BufferSize](FRHICommandListImmediate& RHICmdList)
+        [OutBuffer, OutUAV, OutSRV, BufferSize, BufferStride](FRHICommandListImmediate& RHICmdList)
         {
             FRHIResourceCreateInfo CreateInfo(TEXT("SpawnPositionBuffer"));
-            
-            FBufferRHIRef TempBuffer = RHICmdList.CreateBuffer(
+
+            *OutBuffer = RHICmdList.CreateBuffer(
                 BufferSize,
                 BUF_UnorderedAccess | BUF_ShaderResource | BUF_StructuredBuffer,
                 BufferStride,
                 ERHIAccess::UAVCompute,
                 CreateInfo
             );
-            
-            PositionBuffer = TempBuffer;
-            
-            if (PositionBuffer.IsValid())
+
+            if (OutBuffer->IsValid())
             {
-                PositionBufferUAV = RHICmdList.CreateUnorderedAccessView(PositionBuffer, false, false);
+                // UAV for the compute shader write pass
+                *OutUAV = RHICmdList.CreateUnorderedAccessView(*OutBuffer, false, false);
+
+                // SRV for Niagara's read-only access.
+                // Use the structured buffer descriptor — PF_Unknown asserts on UE5.5+.
+                FRHIViewDesc::FBufferSRV::FInitializer SRVDesc =
+                    FRHIViewDesc::CreateBufferSRV()
+                        .SetType(FRHIViewDesc::EBufferType::Structured);
+                *OutSRV = RHICmdList.CreateShaderResourceView(*OutBuffer, SRVDesc);
             }
         }
     );
-    
+
     FlushRenderingCommands();
 }
 
 void UComputeShaderMeshSpawner::ReleaseBuffers()
 {
     ENQUEUE_RENDER_COMMAND(ReleasePositionBuffer)(
-        [this](FRHICommandListImmediate& RHICmdList)
+        [this](FRHICommandListImmediate&)
         {
+            PositionBufferSRV.SafeRelease();
             PositionBufferUAV.SafeRelease();
             PositionBuffer.SafeRelease();
         }
     );
-    
+
     FlushRenderingCommands();
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Compute shader dispatch (no readback, no ISMC update)
+// ─────────────────────────────────────────────────────────────────────────────
+
 void UComputeShaderMeshSpawner::RunComputeShader()
 {
-
     if (!PositionBuffer.IsValid() || !PositionBufferUAV.IsValid() || !DepthRenderTarget)
         return;
 
+    FBufferRHIRef              CapturedBuffer    = PositionBuffer;
+    FUnorderedAccessViewRHIRef CapturedUAV       = PositionBufferUAV;
+    FTextureRHIRef             CapturedDepth     = DepthRenderTarget->GetResource()->TextureRHI;
 
-
-    FBufferRHIRef CapturedPositionBuffer = PositionBuffer;
-    FUnorderedAccessViewRHIRef CapturedPositionBufferUAV = PositionBufferUAV;
-    FTextureRHIRef CapturedDepthTexture = DepthRenderTarget->GetResource()->TextureRHI;
-    
     FRotationMatrix RotMatrix(CameraRotation);
-    FVector Forward = RotMatrix.GetScaledAxis(EAxis::X);
-    FVector Right = RotMatrix.GetScaledAxis(EAxis::Y);
-    FVector Up = RotMatrix.GetScaledAxis(EAxis::Z);
-    
-    FVector3f CapturedCameraPos = FVector3f(CameraLocation);
-    FVector3f CapturedCameraForward = FVector3f(Forward);
-    FVector3f CapturedCameraRight = FVector3f(Right);
-    FVector3f CapturedCameraUp = FVector3f(Up);
-    
-    float CapturedOrthoWidth = OrthoWidth;
-    float CapturedOrthoHeight = OrthoWidth;
-    uint32 CapturedNumInstances = NumInstances;
-    float CapturedGridCellSize = GridCellSize;
-    float CapturedSpawnDensity = SpawnDensity;
-    float CapturedVerticalOffset = VerticalOffset;
+    FVector3f CapturedCameraPos     = FVector3f(CameraLocation);
+    FVector3f CapturedCameraForward = FVector3f(RotMatrix.GetScaledAxis(EAxis::X));
+    FVector3f CapturedCameraRight   = FVector3f(RotMatrix.GetScaledAxis(EAxis::Y));
+    FVector3f CapturedCameraUp      = FVector3f(RotMatrix.GetScaledAxis(EAxis::Z));
 
-    ENQUEUE_RENDER_COMMAND(ExecuteRaymarchingSpawn)(
-        [CapturedPositionBuffer, CapturedPositionBufferUAV, CapturedDepthTexture,
+    float    CapturedOrthoWidth    = OrthoWidth;
+    float    CapturedOrthoHeight   = OrthoWidth;
+    uint32   CapturedNumInstances  = NumInstances;
+    float    CapturedGridCellSize  = GridCellSize;
+    float    CapturedSpawnDensity  = SpawnDensity;
+    float    CapturedVerticalOffset = VerticalOffset;
+
+    ENQUEUE_RENDER_COMMAND(ExecuteSpawnComputeShader)(
+        [CapturedBuffer, CapturedUAV, CapturedDepth,
          CapturedCameraPos, CapturedCameraForward, CapturedCameraRight, CapturedCameraUp,
          CapturedOrthoWidth, CapturedOrthoHeight, CapturedNumInstances, CapturedGridCellSize,
          CapturedSpawnDensity, CapturedVerticalOffset]
         (FRHICommandListImmediate& RHICmdList)
         {
-            FRDGBuilder GraphBuilder(RHICmdList, RDG_EVENT_NAME("RaymarchingFoliageSpawn"));
+            FRDGBuilder GraphBuilder(RHICmdList, RDG_EVENT_NAME("SpawnPositionCompute"));
 
-            FInstancesComputeShader::FParameters* Parameters = GraphBuilder.AllocParameters<FInstancesComputeShader::FParameters>();
-            Parameters->SpawnPositions = CapturedPositionBufferUAV;
-            Parameters->SceneDepthTexture = CapturedDepthTexture;
-            Parameters->SceneDepthSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
-            Parameters->CameraPosition = CapturedCameraPos;
-            Parameters->CameraForward = CapturedCameraForward;
-            Parameters->CameraRight = CapturedCameraRight;
-            Parameters->CameraUp = CapturedCameraUp;
-            Parameters->OrthoWidth = CapturedOrthoWidth;
-            Parameters->OrthoHeight = CapturedOrthoHeight;
-            Parameters->NumInstances = CapturedNumInstances;
-            Parameters->GridCellSize = CapturedGridCellSize;
-            Parameters->SpawnDensity = CapturedSpawnDensity;
-            Parameters->VerticalOffset = CapturedVerticalOffset;
+            FInstancesComputeShader::FParameters* Parameters =
+                GraphBuilder.AllocParameters<FInstancesComputeShader::FParameters>();
+
+            Parameters->SpawnPositions      = CapturedUAV;
+            Parameters->SceneDepthTexture   = CapturedDepth;
+            Parameters->SceneDepthSampler   = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+            Parameters->CameraPosition      = CapturedCameraPos;
+            Parameters->CameraForward       = CapturedCameraForward;
+            Parameters->CameraRight         = CapturedCameraRight;
+            Parameters->CameraUp            = CapturedCameraUp;
+            Parameters->OrthoWidth          = CapturedOrthoWidth;
+            Parameters->OrthoHeight         = CapturedOrthoHeight;
+            Parameters->NumInstances        = CapturedNumInstances;
+            Parameters->GridCellSize        = CapturedGridCellSize;
+            Parameters->SpawnDensity        = CapturedSpawnDensity;
+            Parameters->VerticalOffset      = CapturedVerticalOffset;
 
             TShaderMapRef<FInstancesComputeShader> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
 
-            FUintVector2 CapturedGridDimensions(8, 8);
-            FIntVector ThreadGroupCount(
-                10,
-                100,
-                1
-            );
-
             FComputeShaderUtils::AddPass(
                 GraphBuilder,
-                RDG_EVENT_NAME("ComputeSpawnPass"),
+                RDG_EVENT_NAME("SpawnPositionPass"),
                 ComputeShader,
                 Parameters,
-                ThreadGroupCount
+                FIntVector(10, 100, 1)
             );
-                
 
             GraphBuilder.Execute();
+
+            // Transition the buffer to SRV so Niagara can read it this frame
+            // without a pipeline stall.
+            RHICmdList.Transition(FRHITransitionInfo(CapturedBuffer, ERHIAccess::UAVCompute, ERHIAccess::SRVMask));
         }
     );
 
-    FlushRenderingCommands();
-    UpdateMeshInstances();
-}
-
-void UComputeShaderMeshSpawner::UpdateMeshInstances()
-{
-    if (!PositionBuffer.IsValid() || !InstancedMeshComponent)
-        return;
-
-    TArray<FVector4f> Positions;
-    Positions.SetNum(NumInstances);
-
-    FBufferRHIRef CapturedBuffer = PositionBuffer;
-    int32 CapturedNumInstances = NumInstances;
-    
-    ENQUEUE_RENDER_COMMAND(ReadBackPositions)(
-        [CapturedBuffer, &Positions, CapturedNumInstances](FRHICommandListImmediate& RHICmdList)
-        {
-            void* BufferData = RHICmdList.LockBuffer(CapturedBuffer, 0, sizeof(FVector4f) * CapturedNumInstances, RLM_ReadOnly);
-            FMemory::Memcpy(Positions.GetData(), BufferData, sizeof(FVector4f) * CapturedNumInstances);
-            RHICmdList.UnlockBuffer(CapturedBuffer);
-        }
-    );
-    
-    FlushRenderingCommands();
-
-    InstancedMeshComponent->ClearInstances();
-    
-    for (int32 i = 0; i < NumInstances; i++)
-        {
-            FTransform Transform;
-            Transform.SetLocation(FVector(Positions[i].X, Positions[i].Y, Positions[i].Z));
-            Transform.SetScale3D(FVector(Positions[i].W));
-
-            InstancedMeshComponent->AddInstance(Transform, true);
-    };
-    
-    // THIS IS THE KEY - properly trigger the update
-    InstancedMeshComponent->MarkRenderStateDirty();
-    InstancedMeshComponent->MarkRenderTransformDirty();
+    // No FlushRenderingCommands here – we intentionally let the RT run ahead.
+    // Niagara will read the SRV on the same render thread, after this command,
+    // so ordering is guaranteed without a CPU stall.
 }
 
 void UComputeShaderMeshSpawner::ExecuteComputeShader()
@@ -297,7 +224,12 @@ void UComputeShaderMeshSpawner::ExecuteComputeShader()
     RunComputeShader();
 }
 
-void UComputeShaderMeshSpawner::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
+// ─────────────────────────────────────────────────────────────────────────────
+// Tick
+// ─────────────────────────────────────────────────────────────────────────────
+
+void UComputeShaderMeshSpawner::TickComponent(float DeltaTime, ELevelTick TickType,
+                                               FActorComponentTickFunction* ThisTickFunction)
 {
     Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
 
@@ -308,6 +240,10 @@ void UComputeShaderMeshSpawner::TickComponent(float DeltaTime, ELevelTick TickTy
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Voxel component list helpers (unchanged)
+// ─────────────────────────────────────────────────────────────────────────────
+
 void UComputeShaderMeshSpawner::UpdateVoxelComponentList()
 {
     if (!SceneCaptureComponent)
@@ -315,35 +251,22 @@ void UComputeShaderMeshSpawner::UpdateVoxelComponentList()
 
     SceneCaptureComponent->ShowOnlyComponents.Empty();
 
-    int32 ComponentCount = 0;
-
     for (TObjectIterator<UPrimitiveComponent> It; It; ++It)
     {
         UPrimitiveComponent* Comp = *It;
-
-        if (Comp &&
-            Comp->GetWorld() == GetWorld() &&
-            Comp->ComponentHasTag(VoxelMeshComponentTag))
-        {
+        if (Comp && Comp->GetWorld() == GetWorld() && Comp->ComponentHasTag(VoxelMeshComponentTag))
             SceneCaptureComponent->ShowOnlyComponents.Add(Comp);
-            ComponentCount++;
-        }
     }
-
 }
 
 void UComputeShaderMeshSpawner::RegisterVoxelMeshComponent(UPrimitiveComponent* Component)
 {
-    if (!SceneCaptureComponent && !Component)
-        return;
-    
-    SceneCaptureComponent->ShowOnlyComponents.Add(Component);
+    if (SceneCaptureComponent && Component)
+        SceneCaptureComponent->ShowOnlyComponents.Add(Component);
 }
 
 void UComputeShaderMeshSpawner::UnregisterVoxelMeshComponent(UPrimitiveComponent* Component)
 {
-    if (!SceneCaptureComponent && !Component)
-        return;
-
-    SceneCaptureComponent->ShowOnlyComponents.Remove(Component);
+    if (SceneCaptureComponent && Component)
+        SceneCaptureComponent->ShowOnlyComponents.Remove(Component);
 }

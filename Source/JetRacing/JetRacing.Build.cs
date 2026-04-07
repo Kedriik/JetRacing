@@ -8,7 +8,7 @@ public class JetRacing : ModuleRules
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 	
-		PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "InputCore", "EnhancedInput","RHI","RenderCore","Renderer", "ProceduralMeshComponent" });
+		PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "InputCore", "EnhancedInput","RHI","RenderCore","Renderer", "ProceduralMeshComponent","Niagara", "NiagaraCore" });
 
 		PrivateDependencyModuleNames.AddRange(new string[] {  });
 
