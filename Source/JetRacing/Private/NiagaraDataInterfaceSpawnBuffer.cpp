@@ -243,15 +243,7 @@ bool UNiagaraDataInterfaceSpawnBuffer::PerInstanceTick(
         InstData->Spawner = SpawnerActor->FindComponentByClass<UComputeShaderMeshSpawner>();
     }
 
-    return false;
-}
-
-bool UNiagaraDataInterfaceSpawnBuffer::PerInstanceTickPostSimulate(
-    void* PerInstanceData, FNiagaraSystemInstance* SystemInstance, float DeltaSeconds)
-{
-    FSpawnBufferInstanceData* InstData = static_cast<FSpawnBufferInstanceData*>(PerInstanceData);
-
-    if (!InstData->Spawner.IsValid())
+     if (!InstData->Spawner.IsValid())
         return false;
 
     FShaderResourceViewRHIRef SRV   = InstData->Spawner->GetPositionBufferSRV();
@@ -269,6 +261,16 @@ bool UNiagaraDataInterfaceSpawnBuffer::PerInstanceTickPostSimulate(
         });
 
     return false;
+
+}
+
+bool UNiagaraDataInterfaceSpawnBuffer::PerInstanceTickPostSimulate(
+    void* PerInstanceData, FNiagaraSystemInstance* SystemInstance, float DeltaSeconds)
+{
+    FSpawnBufferInstanceData* InstData = static_cast<FSpawnBufferInstanceData*>(PerInstanceData);
+    return false;
+
+   
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
