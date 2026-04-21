@@ -105,6 +105,13 @@ void UComputeShaderMeshSpawner::RunComputeShader()
     if (!IndirectInstancingComponent || !DepthRenderTarget)
         return;
 
+    // Keep the component's bounds centred on where instances will actually live
+    // (the capture camera position).  CalcBounds uses both fields to build a
+    // sphere that covers the entire possible instance grid.
+    IndirectInstancingComponent->GridCellSize  = GridCellSize;
+    IndirectInstancingComponent->CaptureOrigin = CameraLocation;
+    IndirectInstancingComponent->UpdateBounds();  // re-evaluates CalcBounds, pushes to renderer
+
     FBufferRHIRef              CapturedInstanceBuffer    = IndirectInstancingComponent->GpuInstanceBuffer;
     FUnorderedAccessViewRHIRef CapturedInstanceBufferUAV = IndirectInstancingComponent->GpuInstanceBufferUAV;
     int32                      CapturedMeshNumIndices    = IndirectInstancingComponent->GpuMeshNumIndices;
@@ -147,9 +154,17 @@ void UComputeShaderMeshSpawner::RunComputeShader()
     float  CapturedScaleMin     = ScaleMin;
     float  CapturedScaleMax     = ScaleMax;
 
+    TArray<FBufferRHIRef> CapturedResetBuffers = IndirectInstancingComponent->GpuIndirectArgsResetBuffers;
+    if (CapturedResetBuffers.Num() != CapturedIndirectBuffers.Num())
+    {
+        UE_LOG(LogTemp, Warning, TEXT("UComputeShaderMeshSpawner: Reset buffers not ready yet."));
+        return;
+    }
+
     ENQUEUE_RENDER_COMMAND(DispatchFoliageComputeShader)(
         [CapturedInstanceBufferUAV,
          CapturedIndirectBuffers, CapturedIndirectBufferUAVs,
+         CapturedResetBuffers,
          CapturedDepthTexture,
          CapturedCameraPos, CapturedCameraForward, CapturedCameraRight, CapturedCameraUp,
          CapturedOrthoWidth, CapturedOrthoHeight, CapturedNumInstances, CapturedNumIndices,
@@ -158,147 +173,124 @@ void UComputeShaderMeshSpawner::RunComputeShader()
         (FRHICommandListImmediate& RHICmdList)
         {
             // ------------------------------------------------------------------
-            // Step 1 — reset all IndirectArgs buffers before the graph.
-            // Each section gets its own IndexCount (pre-baked) and InstanceCount=0.
-            // Buffer[0] is the one the compute shader atomically increments.
+            // All transitions use the appropriate handle:
+            //   - CopyDest / CopySrc  → transition the BUFFER (FRHIBuffer*)
+            //   - UAVCompute          → transition the UAV    (FRHIUnorderedAccessView*)
+            //   - IndirectArgs        → transition the BUFFER (FRHIBuffer*)
+            //   - SRVMask             → transition the UAV    (FRHIUnorderedAccessView*)
+            // D3D12 transitions operate on the underlying resource; using the wrong
+            // view handle for a state that doesn't match the view type causes
+            // DXGI_ERROR_INVALID_CALL / device removal.
             // ------------------------------------------------------------------
+
+            // Step 1 — Reset each IndirectArgs buffer from the pre-baked reset buffer.
             for (int32 i = 0; i < CapturedIndirectBuffers.Num(); i++)
             {
+                // Transition the BUFFER to CopyDest (not the UAV view).
                 RHICmdList.Transition(FRHITransitionInfo(
-                    CapturedIndirectBufferUAVs[i],
+                    CapturedIndirectBuffers[i].GetReference(),
                     ERHIAccess::IndirectArgs,
-                    ERHIAccess::UAVCompute));
+                    ERHIAccess::CopyDest));
 
-                // Read the current args to preserve IndexCount and StartIndex
-                // which were baked at allocation time, then rewrite with InstanceCount=0.
-                uint32 SavedArgs[5];
-                {
-                    const uint32* Src = (const uint32*)RHICmdList.LockBuffer(
-                        CapturedIndirectBuffers[i], 0, 5 * sizeof(uint32), RLM_ReadOnly);
-                    FMemory::Memcpy(SavedArgs, Src, 5 * sizeof(uint32));
-                    RHICmdList.UnlockBuffer(CapturedIndirectBuffers[i]);
-                }
-                {
-                    uint32* Dst = (uint32*)RHICmdList.LockBuffer(
-                        CapturedIndirectBuffers[i], 0, 5 * sizeof(uint32), RLM_WriteOnly);
-                    Dst[0] = SavedArgs[0]; // IndexCountPerInstance — preserved
-                    Dst[1] = 0;            // InstanceCount — reset for atomic increment
-                    Dst[2] = SavedArgs[2]; // StartIndexLocation — preserved
-                    Dst[3] = 0;
-                    Dst[4] = 0;
-                    RHICmdList.UnlockBuffer(CapturedIndirectBuffers[i]);
-                }
+                RHICmdList.CopyBufferRegion(
+                    CapturedIndirectBuffers[i],  0,
+                    CapturedResetBuffers[i],      0,
+                    5 * sizeof(uint32));
+
+                // Transition via UAV handle to UAVCompute (correct for UAV states).
+                RHICmdList.Transition(FRHITransitionInfo(
+                    CapturedIndirectBufferUAVs[i].GetReference(),
+                    ERHIAccess::CopyDest,
+                    ERHIAccess::UAVCompute));
             }
 
-            // Transition instance buffer to UAV
+            // Step 2 — Transition instance buffer to UAV.
             RHICmdList.Transition(FRHITransitionInfo(
-                CapturedInstanceBufferUAV,
+                CapturedInstanceBufferUAV.GetReference(),
                 ERHIAccess::SRVMask,
                 ERHIAccess::UAVCompute));
 
-            // ------------------------------------------------------------------
-            // Step 2 — dispatch compute shader, writing to buffer[0] only.
-            // All sections render the same instances so InstanceCount is shared.
-            // ------------------------------------------------------------------
-            FRDGBuilder GraphBuilder(RHICmdList, RDG_EVENT_NAME("ComputeFoliageSpawn"));
+            // Step 3 — Dispatch the foliage compute shader.
+            // Writes instance matrices into the instance buffer and atomically
+            // increments IndirectArgs[0][1] (InstanceCount).
+            // FComputeShaderUtils::Dispatch takes FRHICommandList& (base class).
+            {
+                TShaderMapRef<FInstancesComputeShader> ComputeShader(
+                    GetGlobalShaderMap(GMaxRHIFeatureLevel));
 
-            FInstancesComputeShader::FParameters* Parameters =
-                GraphBuilder.AllocParameters<FInstancesComputeShader::FParameters>();
+                FInstancesComputeShader::FParameters Params;
+                Params.SpawnInstances    = CapturedInstanceBufferUAV;
+                Params.IndirectArgs      = CapturedIndirectBufferUAVs[0];
+                Params.SceneDepthTexture = CapturedDepthTexture;
+                Params.SceneDepthSampler =
+                    TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+                Params.CameraPosition    = CapturedCameraPos;
+                Params.CameraForward     = CapturedCameraForward;
+                Params.CameraRight       = CapturedCameraRight;
+                Params.CameraUp          = CapturedCameraUp;
+                Params.OrthoWidth        = CapturedOrthoWidth;
+                Params.OrthoHeight       = CapturedOrthoHeight;
+                Params.NumInstances      = CapturedNumInstances;
+                Params.MeshNumIndices    = CapturedNumIndices;
+                Params.GridCellSize      = CapturedGridCellSize;
+                Params.SpawnDensity      = CapturedSpawnDensity;
+                Params.VerticalOffset    = CapturedVertOffset;
+                Params.ScaleMin          = CapturedScaleMin;
+                Params.ScaleMax          = CapturedScaleMax;
 
-            Parameters->SpawnInstances    = CapturedInstanceBufferUAV;
-            Parameters->IndirectArgs      = CapturedIndirectBufferUAVs[0]; // InstanceCount written here
-            Parameters->SceneDepthTexture = CapturedDepthTexture;
-            Parameters->SceneDepthSampler =
-                TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
-            Parameters->CameraPosition    = CapturedCameraPos;
-            Parameters->CameraForward     = CapturedCameraForward;
-            Parameters->CameraRight       = CapturedCameraRight;
-            Parameters->CameraUp          = CapturedCameraUp;
-            Parameters->OrthoWidth        = CapturedOrthoWidth;
-            Parameters->OrthoHeight       = CapturedOrthoHeight;
-            Parameters->NumInstances      = CapturedNumInstances;
-            Parameters->MeshNumIndices    = CapturedNumIndices;
-            Parameters->GridCellSize      = CapturedGridCellSize;
-            Parameters->SpawnDensity      = CapturedSpawnDensity;
-            Parameters->VerticalOffset    = CapturedVertOffset;
-            Parameters->ScaleMin          = CapturedScaleMin;
-            Parameters->ScaleMax          = CapturedScaleMax;
+                const uint32 GroupsY = FMath::DivideAndRoundUp(CapturedNumInstances, 1000u);
 
-            TShaderMapRef<FInstancesComputeShader> ComputeShader(
-                GetGlobalShaderMap(GMaxRHIFeatureLevel));
+                FComputeShaderUtils::Dispatch(
+                    static_cast<FRHICommandList&>(RHICmdList),
+                    ComputeShader, Params,
+                    FIntVector(1, (int32)GroupsY, 1));
+            }
 
-            const uint32 GroupsY = FMath::DivideAndRoundUp(CapturedNumInstances, 1000u);
-            FComputeShaderUtils::AddPass(
-                GraphBuilder,
-                RDG_EVENT_NAME("SpawnFoliageInstances"),
-                ComputeShader,
-                Parameters,
-                FIntVector(1, (int32)GroupsY, 1));
-
-            GraphBuilder.Execute();
-
-            // ------------------------------------------------------------------
-            // Step 3 — propagate InstanceCount from buffer[0] to all other
-            // section buffers, then transition everything back for drawing.
-            // ------------------------------------------------------------------
+            // Step 4 — Propagate InstanceCount from IndirectArgs[0] to other sections.
             if (CapturedIndirectBuffers.Num() > 1)
             {
-                // Read InstanceCount written by the compute shader from buffer[0]
+                // Transition buffer[0] UAVCompute → CopySrc (buffer handle).
                 RHICmdList.Transition(FRHITransitionInfo(
-                    CapturedIndirectBufferUAVs[0],
+                    CapturedIndirectBuffers[0].GetReference(),
                     ERHIAccess::UAVCompute,
-                    ERHIAccess::SRVGraphics));
+                    ERHIAccess::CopySrc));
 
-                const uint32* Src = (const uint32*)RHICmdList.LockBuffer(
-                    CapturedIndirectBuffers[0], 0, 5 * sizeof(uint32), RLM_ReadOnly);
-                uint32 InstanceCount = Src[1];
-                RHICmdList.UnlockBuffer(CapturedIndirectBuffers[0]);
-
-                // Write InstanceCount into all remaining section buffers,
-                // preserving their baked IndexCount and StartIndex.
                 for (int32 i = 1; i < CapturedIndirectBuffers.Num(); i++)
                 {
-                    uint32 SavedArgs[5];
-                    {
-                        const uint32* SectionSrc = (const uint32*)RHICmdList.LockBuffer(
-                            CapturedIndirectBuffers[i], 0, 5 * sizeof(uint32), RLM_ReadOnly);
-                        FMemory::Memcpy(SavedArgs, SectionSrc, 5 * sizeof(uint32));
-                        RHICmdList.UnlockBuffer(CapturedIndirectBuffers[i]);
-                    }
-                    {
-                        uint32* Dst = (uint32*)RHICmdList.LockBuffer(
-                            CapturedIndirectBuffers[i], 0, 5 * sizeof(uint32), RLM_WriteOnly);
-                        Dst[0] = SavedArgs[0]; // IndexCountPerInstance — preserved
-                        Dst[1] = InstanceCount;
-                        Dst[2] = SavedArgs[2]; // StartIndexLocation — preserved
-                        Dst[3] = 0;
-                        Dst[4] = 0;
-                        RHICmdList.UnlockBuffer(CapturedIndirectBuffers[i]);
-                    }
+                    // buffer[i] is still in UAVCompute from Step 1.
+                    RHICmdList.Transition(FRHITransitionInfo(
+                        CapturedIndirectBuffers[i].GetReference(),
+                        ERHIAccess::UAVCompute,
+                        ERHIAccess::CopyDest));
+
+                    RHICmdList.CopyBufferRegion(
+                        CapturedIndirectBuffers[i], 4,
+                        CapturedIndirectBuffers[0], 4,
+                        sizeof(uint32));
 
                     RHICmdList.Transition(FRHITransitionInfo(
-                        CapturedIndirectBufferUAVs[i],
-                        ERHIAccess::UAVCompute,
+                        CapturedIndirectBuffers[i].GetReference(),
+                        ERHIAccess::CopyDest,
                         ERHIAccess::IndirectArgs));
                 }
 
-                // Transition buffer[0] to IndirectArgs
                 RHICmdList.Transition(FRHITransitionInfo(
-                    CapturedIndirectBufferUAVs[0],
-                    ERHIAccess::SRVGraphics,
+                    CapturedIndirectBuffers[0].GetReference(),
+                    ERHIAccess::CopySrc,
                     ERHIAccess::IndirectArgs));
             }
             else
             {
+                // Single section: UAVCompute → IndirectArgs (buffer handle).
                 RHICmdList.Transition(FRHITransitionInfo(
-                    CapturedIndirectBufferUAVs[0],
+                    CapturedIndirectBuffers[0].GetReference(),
                     ERHIAccess::UAVCompute,
                     ERHIAccess::IndirectArgs));
             }
 
-            // Transition instance buffer back to SRV for the vertex factory
+            // Step 5 — Transition instance buffer back to SRV.
             RHICmdList.Transition(FRHITransitionInfo(
-                CapturedInstanceBufferUAV,
+                CapturedInstanceBufferUAV.GetReference(),
                 ERHIAccess::UAVCompute,
                 ERHIAccess::SRVMask));
         }

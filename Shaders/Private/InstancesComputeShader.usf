@@ -156,6 +156,21 @@ void MainCS(uint3 ThreadId : SV_DispatchThreadID)
 
     // -------------------------------------------------------------------------
     // Step 6 — sample depth and reconstruct world Z.
+    //
+    // SCS_SceneDepth stores the linear distance from the camera to the surface
+    // in world units (cm in UE), always positive, measured along the view axis.
+    //
+    // For a top-down orthographic camera with CameraRotation=(-90,0,0):
+    //   CameraForward = (1,0,0) in UE's convention — NOT (0,0,-1).
+    // Using "depth * CameraForward.z" would give 0 because Forward.z==0, or
+    // give the wrong sign for other rotations.
+    //
+    // The correct reconstruction is:
+    //   worldZ = CameraPosition.z  (camera altitude)
+    //          - depth             (surface is depth units BELOW the camera)
+    //          + VerticalOffset    (lift meshes off the ground surface)
+    //
+    // This works for any top-down orthographic camera regardless of yaw.
     // -------------------------------------------------------------------------
     float depth = SceneDepthTexture.SampleLevel(SceneDepthSampler, uv, 0);
 
@@ -165,7 +180,7 @@ void MainCS(uint3 ThreadId : SV_DispatchThreadID)
         return;
     }
 
-    float worldZ = CameraPosition.z + depth * CameraForward.z + VerticalOffset;
+    float worldZ = CameraPosition.z - depth + VerticalOffset;
 
     float3 worldPosition = float3(worldXY, worldZ);
 

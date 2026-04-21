@@ -26,6 +26,22 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Compute Spawning")
 	int32 MaxInstances = 10000;
 
+	/**
+	 * Must match UComputeShaderMeshSpawner::GridCellSize.
+	 * Used by CalcBounds to compute a bounds sphere that covers all possible
+	 * instance positions without depending on this component's local transform.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Compute Spawning")
+	float GridCellSize = 50.0f;
+
+	/**
+	 * World-space position of the depth-capture camera at the time of the last
+	 * compute dispatch.  Updated by UComputeShaderMeshSpawner::RunComputeShader
+	 * so that CalcBounds stays centred on where instances actually live.
+	 * Changing this automatically calls UpdateBounds() to refresh culling.
+	 */
+	FVector CaptureOrigin = FVector::ZeroVector;
+
 	// -------------------------------------------------------------------------
 	// GPU buffers — allocated in CreateRenderThreadResources, written each frame
 	// by UComputeShaderMeshSpawner::RunComputeShader, read by the scene proxy.
@@ -51,6 +67,25 @@ public:
 	 * writes to GpuIndirectArgsBuffers[0].
 	 */
 	int32 GpuMeshNumIndices = 0;
+
+	/**
+	 * Immutable per-section args baked at allocation time:
+	 *   [0] = IndexCountPerInstance
+	 *   [2] = StartIndexLocation
+	 * Used by RunComputeShader to reset InstanceCount to 0 each frame without
+	 * locking the GPU buffer for CPU readback (which is not allowed on modern RHIs
+	 * when the buffer is in UAVCompute state).
+	 */
+	struct FStaticIndirectArgs { uint32 IndexCount; uint32 StartIndex; };
+	TArray<FStaticIndirectArgs> GpuIndirectArgsStatic;
+
+	/**
+	 * One read-only (BUF_CopySrc) 5×uint32 buffer per section, pre-filled at
+	 * creation with [IndexCount, 0, StartIndex, 0, 0].  Each frame we GPU-copy
+	 * from here into GpuIndirectArgsBuffers[i] to reset InstanceCount to 0
+	 * with a pure CopyBufferRegion — no CPU lock, no staging upload.
+	 */
+	TArray<FBufferRHIRef> GpuIndirectArgsResetBuffers;
 
 protected:
 	virtual void OnRegister() override;

@@ -27,15 +27,26 @@ Buffer<float4> MeshTangentBuffer;
 Buffer<float2> MeshUVBuffer;
 uint           MeshNumTexCoords;
 
-// Build the 4×4 matrix from the three stored columns.
-// mul(M, float4(v,1)) == TRS*v + T  (column-vector convention)
+// Build the 4×4 instance-to-world matrix from the three stored row vectors.
+//
+// Despite the "column" naming in MeshRenderInstance, BuildInstance actually
+// stores the three ROWS of a 3×4 row-major matrix, with translation packed
+// into the .w component of each row:
+//   InstanceToWorld0 = (Xx, Xy, Xz, Tx)  ← row 0
+//   InstanceToWorld1 = (Yx, Yy, Yz, Ty)  ← row 1
+//   InstanceToWorld2 = (Zx, Zy, Zz, Tz)  ← row 2
+//
+// HLSL's float4x4(r0,r1,r2,r3) constructor fills rows, so we pass the three
+// stored vectors directly as rows 0-2 and add an identity row 3.
+// mul(M, float4(v,1)) then evaluates as dot(row_i, float4(v,1)) per component,
+// which correctly applies scale/rotation and adds the translation from .w.
 float4x4 GetInstMatrix(MeshRenderInstance Inst)
 {
     return float4x4(
-        Inst.InstanceToWorld0,
-        Inst.InstanceToWorld1,
-        Inst.InstanceToWorld2,
-        float4(0.0f, 0.0f, 0.0f, 1.0f)
+        Inst.InstanceToWorld0,              // row 0: (Xx, Xy, Xz, Tx)
+        Inst.InstanceToWorld1,              // row 1: (Yx, Yy, Yz, Ty)
+        Inst.InstanceToWorld2,              // row 2: (Zx, Zy, Zz, Tz)
+        float4(0.0f, 0.0f, 0.0f, 1.0f)     // row 3: homogeneous
     );
 }
 
@@ -125,9 +136,47 @@ FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput In
     MeshRenderInstance Inst = InstanceBuffer[Input.InstanceId];
     float4x4 M = GetInstMatrix(Inst);
 
-    Intermediates.WorldPos      = mul(M, float4(MeshPos,           1.0f)).xyz;
-    Intermediates.WorldTangentX = normalize(mul(M, float4(TangentX4.xyz, 0.0f)).xyz);
-    Intermediates.WorldTangentZ = normalize(mul(M, float4(TangentZ4.xyz, 0.0f)).xyz);
+    // -------------------------------------------------------------------------
+    // Large-world precision: avoid catastrophic cancellation.
+    //
+    // The instance matrix stores ABSOLUTE world-space translation (e.g. 200 000 UU).
+    // Doing  mul(M, float4(MeshPos, 1))  adds a small mesh vertex (~100 UU) to a
+    // large translation in float32 arithmetic.  At 200 000 UU from origin the ULP
+    // of a float32 is ~0.016 UU, so mesh-vertex contributions beyond that scale
+    // are rounded away — the mesh collapses to a point and gets clipped/culled.
+    //
+    // UE5 fix — "Translated World Space" (TWS):
+    //   PreViewTranslation = -CameraPosition  (updated every frame on render thread)
+    //   TranslatedWorldPos = AbsoluteWorldPos + PreViewTranslation
+    //                      = AbsoluteWorldPos - CameraPosition    (always small!)
+    //
+    // We apply PreViewTranslation to the TRANSLATION part of the matrix first,
+    // while it is still a standalone float3, then add the (small) rotated mesh
+    // vertex.  Both additions are now between small numbers → full precision.
+    //
+    //   T_world = float3(row0.w, row1.w, row2.w)   absolute world pos (large)
+    //   T_tws   = T_world + PreViewTranslation       camera-relative   (small)
+    //   RS      = upper-left 3x3 of M               rotation + scale   (small)
+    //   TranslatedWorldPos = RS * MeshPos + T_tws    both terms small → precise
+    // -------------------------------------------------------------------------
+
+    // Rotation-scale block (upper-left 3x3, no translation).
+    float3x3 RS = float3x3(
+        M[0].xyz,   // row 0 rotation+scale
+        M[1].xyz,   // row 1
+        M[2].xyz);  // row 2
+
+    // Instance translation in absolute world space (large float).
+    float3 T_world = float3(M[0].w, M[1].w, M[2].w);
+
+    // Shift to Translated World Space — result is camera-relative and small.
+    float3 T_tws = T_world + (float3)ResolvedView.PreViewTranslation;
+
+    // Final position: rotated local vertex + camera-relative translation.
+    // Both operands are small → no precision loss.
+    Intermediates.WorldPos      = mul(RS, MeshPos) + T_tws;
+    Intermediates.WorldTangentX = normalize(mul(RS, TangentX4.xyz));
+    Intermediates.WorldTangentZ = normalize(mul(RS, TangentZ4.xyz));
 
     return Intermediates;
 }
@@ -177,11 +226,13 @@ uint GetPrimitiveId(FVertexFactoryInterpolantsVSToPS Interpolants)         { ret
 uint VertexFactoryGetPrimitiveId(FVertexFactoryInterpolantsVSToPS Interpolants) { return 0; }
 
 // ---------------------------------------------------------------------------
-// World position — instance matrices already contain ComponentToWorld
+// World position — already in Translated World Space from GetVertexFactoryIntermediates
 // ---------------------------------------------------------------------------
 float4 VertexFactoryGetWorldPosition(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
 {
-    return float4((float3)Intermediates.WorldPos + (float3)ResolvedView.PreViewTranslation, 1.0f);
+    // Intermediates.WorldPos was computed as RS*MeshPos + (T_world + PreViewTranslation),
+    // so it is already in Translated World Space.  Do NOT add PreViewTranslation again.
+    return float4(Intermediates.WorldPos, 1.0f);
 }
 
 float4 VertexFactoryGetRasterizedWorldPosition(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates, float4 InWorldPosition)
@@ -196,7 +247,11 @@ float3 VertexFactoryGetPositionForVertexLighting(FVertexFactoryInput Input, FVer
 
 float4 VertexFactoryGetPreviousWorldPosition(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
 {
-    return float4((float3)Intermediates.WorldPos + (float3)ResolvedView.PrevPreViewTranslation, 1.0f);
+    // For the previous frame we need TWS relative to the previous camera position.
+    // Intermediates.WorldPos = RS*MeshPos + T_world + PreViewTranslation (current frame).
+    // Undo current PreViewTranslation, apply previous frame's.
+    float3 T_world_plus_RS_mesh = Intermediates.WorldPos - (float3)ResolvedView.PreViewTranslation;
+    return float4(T_world_plus_RS_mesh + (float3)ResolvedView.PrevPreViewTranslation, 1.0f);
 }
 
 // ---------------------------------------------------------------------------

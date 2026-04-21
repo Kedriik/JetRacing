@@ -147,6 +147,11 @@ public:
 			OwnerComponent->GpuIndirectArgsBuffers[SectionIdx] =
 				RHICmdList.CreateVertexBuffer(
 					5 * sizeof(uint32),
+					// BUF_DrawIndirect: source for indirect draw calls.
+					// BUF_UnorderedAccess: compute shader writes InstanceCount atomically.
+					// NOTE: do NOT add BUF_Dynamic — that forces D3D12 UPLOAD heap which
+					// cannot transition to UAVCompute or CopyDest, causing device removal.
+					// The per-frame reset is done via CopyBufferRegion from a static buffer.
 					BUF_DrawIndirect | BUF_UnorderedAccess,
 					ERHIAccess::IndirectArgs, CI);
 			OwnerComponent->GpuIndirectArgsBufferUAVs[SectionIdx] =
@@ -159,6 +164,38 @@ public:
 		for (const FComputeDrivenSection& S : Sections)
 			TotalIndices += (int32)S.NumIndices;
 		OwnerComponent->GpuMeshNumIndices = TotalIndices;
+
+		// Cache the immutable per-section values so RunComputeShader can reset
+		// InstanceCount to 0 each frame without locking the GPU buffer.
+		OwnerComponent->GpuIndirectArgsStatic.SetNum(Sections.Num());
+		for (int32 SectionIdx = 0; SectionIdx < Sections.Num(); SectionIdx++)
+		{
+			OwnerComponent->GpuIndirectArgsStatic[SectionIdx].IndexCount = Sections[SectionIdx].NumIndices;
+			OwnerComponent->GpuIndirectArgsStatic[SectionIdx].StartIndex = Sections[SectionIdx].FirstIndex;
+		}
+
+		// Create one small BUF_CopySrc reset buffer per section.
+		// Pre-filled with [IndexCount, 0, StartIndex, 0, 0] — never changes.
+		// Each frame RunComputeShader does a GPU CopyBufferRegion from here into
+		// GpuIndirectArgsBuffers[i], resetting InstanceCount to 0 with zero CPU cost.
+		OwnerComponent->GpuIndirectArgsResetBuffers.SetNum(Sections.Num());
+		for (int32 SectionIdx = 0; SectionIdx < Sections.Num(); SectionIdx++)
+		{
+			TResourceArray<uint32, VERTEXBUFFER_ALIGNMENT> ResetData;
+			ResetData.Add(Sections[SectionIdx].NumIndices);  // [0] IndexCountPerInstance
+			ResetData.Add(0u);                                // [1] InstanceCount = 0
+			ResetData.Add(Sections[SectionIdx].FirstIndex);  // [2] StartIndexLocation
+			ResetData.Add(0u);                                // [3] BaseVertexLocation
+			ResetData.Add(0u);                                // [4] StartInstanceLocation
+
+			FRHIResourceCreateInfo ResetCI(TEXT("ComputeDriven.IndirectArgsReset"), &ResetData);
+			OwnerComponent->GpuIndirectArgsResetBuffers[SectionIdx] =
+				RHICmdList.CreateVertexBuffer(
+					5 * sizeof(uint32),
+					BUF_Static,      // CPU-written once at creation, GPU reads only
+					ERHIAccess::CopySrc,
+					ResetCI);
+		}
 
 		// Update local cached refs
 		ComponentInstanceBufferSRV   = OwnerComponent->GpuInstanceBufferSRV;
@@ -316,8 +353,28 @@ void UComputeDrivenIndirectInstancingComponent::ApplyWorldOffset(
 FBoxSphereBounds UComputeDrivenIndirectInstancingComponent::CalcBounds(
 	const FTransform& LocalToWorld) const
 {
-	const float HalfSize = 50000.f;
-	return FBoxSphereBounds(FBox(FVector(-HalfSize), FVector(HalfSize))).TransformBy(LocalToWorld);
+	// This is a GPU-driven indirect primitive: the CPU has no knowledge of
+	// individual instance positions. The bounds exist only to pass the coarse
+	// scene-level frustum/distance cull so that GetDynamicMeshElements is called.
+	// Per-instance GPU culling (HZB, occlusion) handles fine-grained visibility.
+	//
+	// Key insight: instances are placed ON THE GROUND directly below the capture
+	// camera. CaptureOrigin is the camera's 3D position (e.g. Z = 2,000,000 UU
+	// altitude), but the instances live at roughly Z = 0. Centring the sphere
+	// on CaptureOrigin puts the entire ground grid outside the sphere.
+	//
+	// Correct centre: (CaptureOrigin.XY, 0) — ground projection of the camera.
+	// Correct radius: large enough to cover the entire possible grid footprint
+	// plus a generous vertical margin for sloped terrain and mesh height.
+	const float GridSide     = FMath::Sqrt((float)FMath::Max(MaxInstances, 1));
+	const float HalfGridXY   = (GridSide * 0.5f + 1.0f) * GridCellSize;
+	const float VerticalHalf = 500000.f; // ±5 km vertical range — covers any terrain
+
+	// Sphere centred at the ground footprint of the capture camera.
+	const FVector Centre(CaptureOrigin.X, CaptureOrigin.Y, 0.0);
+	const float   Radius = FMath::Sqrt(HalfGridXY * HalfGridXY * 2.f + VerticalHalf * VerticalHalf);
+
+	return FBoxSphereBounds(Centre, FVector(Radius), Radius);
 }
 
 FPrimitiveSceneProxy* UComputeDrivenIndirectInstancingComponent::CreateSceneProxy()
