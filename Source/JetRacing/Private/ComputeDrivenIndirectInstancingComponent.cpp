@@ -15,14 +15,14 @@
 #include "RHIResources.h"
 
 // ============================================================================
-// Per-section data captured at proxy construction time
+// Per-section data captured at proxy construction time (game thread)
 // ============================================================================
 struct FComputeDrivenSection
 {
 	FMaterialRenderProxy* MaterialProxy   = nullptr;
 	FMaterialRelevance    MaterialRelevance;
-	uint32                FirstIndex      = 0;   // byte offset into the index buffer
-	uint32                NumIndices      = 0;   // indices in this section
+	uint32                FirstIndex      = 0;
+	uint32                NumIndices      = 0;
 	int32                 MinVertexIndex  = 0;
 	int32                 MaxVertexIndex  = 0;
 };
@@ -39,46 +39,34 @@ public:
 		, MeshIndexBuffer(nullptr)
 		, MeshVertexBuffers(nullptr)
 		, MeshNumTexCoords(1)
-		, ComponentInstanceBufferSRV(InComponent->GpuInstanceBufferSRV)
-		, OwnerComponent(InComponent)
+		, NumInstancesSnapshot(InComponent->MaxInstances)
+		, SharedBuffers(InComponent->GpuBuffers)  // hold the same TSharedPtr
 	{
 		UStaticMesh* StaticMesh = InComponent->Mesh;
 		if (!StaticMesh || !StaticMesh->GetRenderData() ||
 			StaticMesh->GetRenderData()->LODResources.Num() == 0)
-		{
 			return;
-		}
 
 		FStaticMeshLODResources& LOD = StaticMesh->GetRenderData()->LODResources[0];
 		MeshVertexBuffers = &LOD.VertexBuffers;
 		MeshIndexBuffer   = &LOD.IndexBuffer;
 		MeshNumTexCoords  = LOD.VertexBuffers.StaticMeshVertexBuffer.GetNumTexCoords();
 
-		// Build one section entry per LOD section, reading the material from
-		// the mesh's material slots — exactly what the editor assigns.
-		for (int32 SectionIdx = 0; SectionIdx < LOD.Sections.Num(); SectionIdx++)
+		for (int32 i = 0; i < LOD.Sections.Num(); i++)
 		{
-			const FStaticMeshSection& MeshSection = LOD.Sections[SectionIdx];
-
-			UMaterialInterface* Mat = StaticMesh->GetMaterial(MeshSection.MaterialIndex);
-			if (!Mat)
-				Mat = UMaterial::GetDefaultMaterial(MD_Surface);
+			const FStaticMeshSection& MS = LOD.Sections[i];
+			UMaterialInterface* Mat = StaticMesh->GetMaterial(MS.MaterialIndex);
+			if (!Mat) Mat = UMaterial::GetDefaultMaterial(MD_Surface);
 
 			FComputeDrivenSection& S = Sections.AddDefaulted_GetRef();
 			S.MaterialProxy     = Mat->GetRenderProxy();
 			S.MaterialRelevance = Mat->GetRelevance_Concurrent(GetScene().GetFeatureLevel());
-			S.FirstIndex       = MeshSection.FirstIndex;
-			S.NumIndices       = MeshSection.NumTriangles * 3;
-			S.MinVertexIndex   = MeshSection.MinVertexIndex;
-			S.MaxVertexIndex   = MeshSection.MaxVertexIndex;
-
-			// Accumulate material relevance across all sections
+			S.FirstIndex        = MS.FirstIndex;
+			S.NumIndices        = MS.NumTriangles * 3;
+			S.MinVertexIndex    = MS.MinVertexIndex;
+			S.MaxVertexIndex    = MS.MaxVertexIndex;
 			CombinedMaterialRelevance |= S.MaterialRelevance;
 		}
-
-		// Snapshot the per-section indirect arg buffers from the component.
-		// These are null until CreateRenderThreadResources — GetDynamicMeshElements guards.
-		ComponentIndirectArgsBuffers = InComponent->GpuIndirectArgsBuffers;
 	}
 
 	virtual SIZE_T GetTypeHash() const override
@@ -96,110 +84,72 @@ public:
 	{
 		FPrimitiveSceneProxy::CreateRenderThreadResources(RHICmdList);
 
+		// Vertex factory
 		FComputeDrivenInstancingParameters UniformParams;
 		VertexFactory = new FComputeDrivenInstancingVertexFactory(
 			GetScene().GetFeatureLevel(), UniformParams);
-
 		if (MeshVertexBuffers && MeshIndexBuffer)
 			VertexFactory->SetMeshBuffers(MeshVertexBuffers, MeshIndexBuffer);
-
 		VertexFactory->InitResource(RHICmdList);
 
-		if (!OwnerComponent)
-			return;
+		// All GPU buffers are created here on the render thread and stored in the
+		// shared block.  We never touch the UObject component pointer from here —
+		// the component may be GC-moved at any time.  The TSharedPtr keeps the
+		// block alive even if the component or proxy is destroyed first.
+		check(SharedBuffers.IsValid());
 
-		// ---- Instance buffer (shared across all sections) ----
-		const uint32 InstanceStride     = 3 * sizeof(FVector4f); // MeshRenderInstance
-		const uint32 InstanceBufferSize = (uint32)OwnerComponent->MaxInstances * InstanceStride;
+		const uint32 InstanceStride     = 3 * sizeof(FVector4f);
+		const uint32 InstanceBufferSize = (uint32)NumInstancesSnapshot * InstanceStride;
 
+		// Instance buffer
 		{
-			FRHIResourceCreateInfo CI(TEXT("ComputeDriven.GpuInstanceBuffer"));
-			OwnerComponent->GpuInstanceBuffer = RHICmdList.CreateStructuredBuffer(
+			FRHIResourceCreateInfo CI(TEXT("ComputeDriven.InstanceBuffer"));
+			SharedBuffers->InstanceBuffer = RHICmdList.CreateStructuredBuffer(
 				InstanceStride, InstanceBufferSize,
 				BUF_UnorderedAccess | BUF_ShaderResource,
 				ERHIAccess::SRVMask, CI);
-			OwnerComponent->GpuInstanceBufferUAV = RHICmdList.CreateUnorderedAccessView(
-				OwnerComponent->GpuInstanceBuffer, false, false);
-			OwnerComponent->GpuInstanceBufferSRV = RHICmdList.CreateShaderResourceView(
-				OwnerComponent->GpuInstanceBuffer);
+			SharedBuffers->InstanceBufferUAV = RHICmdList.CreateUnorderedAccessView(
+				SharedBuffers->InstanceBuffer, false, false);
+			SharedBuffers->InstanceBufferSRV = RHICmdList.CreateShaderResourceView(
+				SharedBuffers->InstanceBuffer);
 		}
 
-		// ---- One IndirectArgs buffer per section ----
-		// All sections draw the same instances, so InstanceCount is the same
-		// for every buffer. The compute shader writes to buffer[0] only.
-		// We copy InstanceCount from buffer[0] to the others before drawing.
-		OwnerComponent->GpuIndirectArgsBuffers.SetNum(Sections.Num());
-		OwnerComponent->GpuIndirectArgsBufferUAVs.SetNum(Sections.Num());
+		// IndirectArgs + reset buffers
+		const int32 NumSections = Sections.Num();
+		SharedBuffers->IndirectArgsBuffers.SetNum(NumSections);
+		SharedBuffers->IndirectArgsBufferUAVs.SetNum(NumSections);
+		SharedBuffers->IndirectArgsResetBuffers.SetNum(NumSections);
 
-		for (int32 SectionIdx = 0; SectionIdx < Sections.Num(); SectionIdx++)
-		{
-			const FComputeDrivenSection& S = Sections[SectionIdx];
-
-			// Pre-fill: [NumIndices, 0, FirstIndex, 0, 0]
-			TResourceArray<uint32, VERTEXBUFFER_ALIGNMENT> Args;
-			Args.Add(S.NumIndices);  // IndexCountPerInstance
-			Args.Add(0);             // InstanceCount — filled by compute shader
-			Args.Add(S.FirstIndex);  // StartIndexLocation
-			Args.Add(0);             // BaseVertexLocation
-			Args.Add(0);             // StartInstanceLocation
-
-			FRHIResourceCreateInfo CI(TEXT("ComputeDriven.GpuIndirectArgsBuffer"), &Args);
-			OwnerComponent->GpuIndirectArgsBuffers[SectionIdx] =
-				RHICmdList.CreateVertexBuffer(
-					5 * sizeof(uint32),
-					// BUF_DrawIndirect: source for indirect draw calls.
-					// BUF_UnorderedAccess: compute shader writes InstanceCount atomically.
-					// NOTE: do NOT add BUF_Dynamic — that forces D3D12 UPLOAD heap which
-					// cannot transition to UAVCompute or CopyDest, causing device removal.
-					// The per-frame reset is done via CopyBufferRegion from a static buffer.
-					BUF_DrawIndirect | BUF_UnorderedAccess,
-					ERHIAccess::IndirectArgs, CI);
-			OwnerComponent->GpuIndirectArgsBufferUAVs[SectionIdx] =
-				RHICmdList.CreateUnorderedAccessView(
-					OwnerComponent->GpuIndirectArgsBuffers[SectionIdx], PF_R32_UINT);
-		}
-
-		// Total index count (used by RunComputeShader to check readiness)
 		int32 TotalIndices = 0;
-		for (const FComputeDrivenSection& S : Sections)
+		for (int32 i = 0; i < NumSections; i++)
+		{
+			const FComputeDrivenSection& S = Sections[i];
 			TotalIndices += (int32)S.NumIndices;
-		OwnerComponent->GpuMeshNumIndices = TotalIndices;
 
-		// Cache the immutable per-section values so RunComputeShader can reset
-		// InstanceCount to 0 each frame without locking the GPU buffer.
-		OwnerComponent->GpuIndirectArgsStatic.SetNum(Sections.Num());
-		for (int32 SectionIdx = 0; SectionIdx < Sections.Num(); SectionIdx++)
-		{
-			OwnerComponent->GpuIndirectArgsStatic[SectionIdx].IndexCount = Sections[SectionIdx].NumIndices;
-			OwnerComponent->GpuIndirectArgsStatic[SectionIdx].StartIndex = Sections[SectionIdx].FirstIndex;
+			// IndirectArgs: [IndexCount, InstanceCount=0, StartIndex, 0, 0]
+			TResourceArray<uint32, VERTEXBUFFER_ALIGNMENT> Args;
+			Args.Add(S.NumIndices); Args.Add(0); Args.Add(S.FirstIndex); Args.Add(0); Args.Add(0);
+			FRHIResourceCreateInfo CI(TEXT("ComputeDriven.IndirectArgs"), &Args);
+			SharedBuffers->IndirectArgsBuffers[i] = RHICmdList.CreateVertexBuffer(
+				5 * sizeof(uint32), BUF_DrawIndirect | BUF_UnorderedAccess,
+				ERHIAccess::IndirectArgs, CI);
+			SharedBuffers->IndirectArgsBufferUAVs[i] = RHICmdList.CreateUnorderedAccessView(
+				SharedBuffers->IndirectArgsBuffers[i], PF_R32_UINT);
+
+			// Reset buffer (BUF_CopySrc, never changes)
+			TResourceArray<uint32, VERTEXBUFFER_ALIGNMENT> Reset;
+			Reset.Add(S.NumIndices); Reset.Add(0u); Reset.Add(S.FirstIndex); Reset.Add(0u); Reset.Add(0u);
+			FRHIResourceCreateInfo ResetCI(TEXT("ComputeDriven.IndirectArgsReset"), &Reset);
+			SharedBuffers->IndirectArgsResetBuffers[i] = RHICmdList.CreateVertexBuffer(
+				5 * sizeof(uint32), BUF_Static, ERHIAccess::CopySrc, ResetCI);
 		}
 
-		// Create one small BUF_CopySrc reset buffer per section.
-		// Pre-filled with [IndexCount, 0, StartIndex, 0, 0] — never changes.
-		// Each frame RunComputeShader does a GPU CopyBufferRegion from here into
-		// GpuIndirectArgsBuffers[i], resetting InstanceCount to 0 with zero CPU cost.
-		OwnerComponent->GpuIndirectArgsResetBuffers.SetNum(Sections.Num());
-		for (int32 SectionIdx = 0; SectionIdx < Sections.Num(); SectionIdx++)
-		{
-			TResourceArray<uint32, VERTEXBUFFER_ALIGNMENT> ResetData;
-			ResetData.Add(Sections[SectionIdx].NumIndices);  // [0] IndexCountPerInstance
-			ResetData.Add(0u);                                // [1] InstanceCount = 0
-			ResetData.Add(Sections[SectionIdx].FirstIndex);  // [2] StartIndexLocation
-			ResetData.Add(0u);                                // [3] BaseVertexLocation
-			ResetData.Add(0u);                                // [4] StartInstanceLocation
+		SharedBuffers->MeshNumIndices = TotalIndices;
 
-			FRHIResourceCreateInfo ResetCI(TEXT("ComputeDriven.IndirectArgsReset"), &ResetData);
-			OwnerComponent->GpuIndirectArgsResetBuffers[SectionIdx] =
-				RHICmdList.CreateVertexBuffer(
-					5 * sizeof(uint32),
-					BUF_Static,      // CPU-written once at creation, GPU reads only
-					ERHIAccess::CopySrc,
-					ResetCI);
-		}
-
-		// Update local cached refs
-		ComponentInstanceBufferSRV   = OwnerComponent->GpuInstanceBufferSRV;
-		ComponentIndirectArgsBuffers = OwnerComponent->GpuIndirectArgsBuffers;
+		// Signal readiness AFTER all buffers are fully constructed.
+		// The game thread polls bReady before dispatching the compute shader.
+		FPlatformMisc::MemoryBarrier();
+		SharedBuffers->bReady = true;
 	}
 
 	virtual void DestroyRenderThreadResources() override
@@ -210,9 +160,10 @@ public:
 			delete VertexFactory;
 			VertexFactory = nullptr;
 		}
-
-		ComponentInstanceBufferSRV.SafeRelease();
-		ComponentIndirectArgsBuffers.Empty();
+		// SharedBuffers is a TSharedPtr — releasing our ref here is safe.
+		// The component still holds its own ref and will keep the buffers alive
+		// as long as RunComputeShader needs them.
+		SharedBuffers.Reset();
 	}
 
 	virtual void OnTransformChanged(FRHICommandListBase& RHICmdList) override {}
@@ -220,11 +171,11 @@ public:
 	virtual FPrimitiveViewRelevance GetViewRelevance(const FSceneView* View) const override
 	{
 		FPrimitiveViewRelevance Result;
-		Result.bDrawRelevance        = IsShown(View);
-		Result.bShadowRelevance      = IsShadowCast(View) && ShouldRenderInMainPass();
+		Result.bDrawRelevance        = true;
+		Result.bShadowRelevance      = true;
 		Result.bDynamicRelevance     = true;
 		Result.bStaticRelevance      = false;
-		Result.bRenderInMainPass     = ShouldRenderInMainPass();
+		Result.bRenderInMainPass     = true;
 		Result.bUsesLightingChannels = GetLightingChannelMask() != GetDefaultLightingChannelMask();
 		Result.bRenderCustomDepth    = ShouldRenderCustomDepth();
 		CombinedMaterialRelevance.SetPrimitiveViewRelevance(Result);
@@ -234,60 +185,52 @@ public:
 	virtual void GetDynamicMeshElements(
 		const TArray<const FSceneView*>& Views,
 		const FSceneViewFamily&          ViewFamily,
-		uint32                           VisibilityMap,
+		uint32                           /*VisibilityMap*/,
 		FMeshElementCollector&           Collector) const override
 	{
 		check(IsInRenderingThread() || IsInParallelRenderingThread());
 
-		if (!MeshIndexBuffer || Sections.Num() == 0 || !ComponentInstanceBufferSRV ||
-			ComponentIndirectArgsBuffers.Num() != Sections.Num())
-		{
+		if (!SharedBuffers.IsValid() || !SharedBuffers->bReady ||
+			!MeshIndexBuffer || Sections.Num() == 0 ||
+			SharedBuffers->IndirectArgsBuffers.Num() != Sections.Num())
 			return;
-		}
 
 		for (int32 ViewIndex = 0; ViewIndex < Views.Num(); ViewIndex++)
 		{
-			if (!(VisibilityMap & (1 << ViewIndex)))
-				continue;
-
-			// One FMeshBatch per section — each gets its own material and
-			// its own IndirectArgs buffer (with the correct FirstIndex baked in).
-			for (int32 SectionIdx = 0; SectionIdx < Sections.Num(); SectionIdx++)
+			for (int32 Si = 0; Si < Sections.Num(); Si++)
 			{
-				const FComputeDrivenSection& S = Sections[SectionIdx];
-
-				if (!ComponentIndirectArgsBuffers[SectionIdx].IsValid())
-					continue;
+				const FComputeDrivenSection& S = Sections[Si];
+				if (!SharedBuffers->IndirectArgsBuffers[Si].IsValid()) continue;
 
 				FMeshBatch& Mesh = Collector.AllocateMesh();
-				Mesh.bWireframe                    = AllowDebugViewmodes() && ViewFamily.EngineShowFlags.Wireframe;
-				Mesh.bUseWireframeSelectionColoring = IsSelected();
-				Mesh.VertexFactory                 = VertexFactory;
-				Mesh.MaterialRenderProxy           = S.MaterialProxy;
-				Mesh.ReverseCulling                = IsLocalToWorldDeterminantNegative();
-				Mesh.Type                          = PT_TriangleList;
-				Mesh.DepthPriorityGroup            = SDPG_World;
-				Mesh.bCanApplyViewModeOverrides    = true;
-				Mesh.bUseForMaterial               = true;
-				Mesh.CastShadow                    = true;
-				Mesh.bUseForDepthPass              = true;
+				Mesh.bWireframe                     = AllowDebugViewmodes() && ViewFamily.EngineShowFlags.Wireframe;
+				Mesh.bUseWireframeSelectionColoring  = IsSelected();
+				Mesh.VertexFactory                  = VertexFactory;
+				Mesh.MaterialRenderProxy            = S.MaterialProxy;
+				Mesh.ReverseCulling                 = IsLocalToWorldDeterminantNegative();
+				Mesh.Type                           = PT_TriangleList;
+				Mesh.DepthPriorityGroup             = SDPG_World;
+				Mesh.bCanApplyViewModeOverrides      = true;
+				Mesh.bUseForMaterial                = true;
+				Mesh.CastShadow                     = true;
+				Mesh.bUseForDepthPass               = true;
 
-				FMeshBatchElement& BatchElement     = Mesh.Elements[0];
-				BatchElement.IndexBuffer            = MeshIndexBuffer;
-				BatchElement.IndirectArgsBuffer     = ComponentIndirectArgsBuffers[SectionIdx];
-				BatchElement.IndirectArgsOffset     = 0;
-				BatchElement.FirstIndex             = 0; // StartIndex is baked into IndirectArgs
-				BatchElement.NumPrimitives          = 0; // ignored with IndirectArgsBuffer
-				BatchElement.MinVertexIndex         = S.MinVertexIndex;
-				BatchElement.MaxVertexIndex         = S.MaxVertexIndex;
-				BatchElement.PrimitiveIdMode        = PrimID_ForceZero;
-				BatchElement.PrimitiveUniformBuffer = GetUniformBuffer();
+				FMeshBatchElement& E = Mesh.Elements[0];
+				E.IndexBuffer            = MeshIndexBuffer;
+				E.IndirectArgsBuffer     = SharedBuffers->IndirectArgsBuffers[Si];
+				E.IndirectArgsOffset     = 0;
+				E.FirstIndex             = 0;
+				E.NumPrimitives          = 0;
+				E.MinVertexIndex         = S.MinVertexIndex;
+				E.MaxVertexIndex         = S.MaxVertexIndex;
+				E.PrimitiveIdMode        = PrimID_ForceZero;
+				E.PrimitiveUniformBuffer = GetUniformBuffer();
 
 				FComputeDrivenInstancingUserData* UserData =
 					&Collector.AllocateOneFrameResource<FComputeDrivenInstancingUserData>();
-				BatchElement.UserData = UserData;
+				E.UserData = UserData;
 
-				UserData->InstanceBufferSRV = ComponentInstanceBufferSRV.GetReference();
+				UserData->InstanceBufferSRV = SharedBuffers->InstanceBufferSRV.GetReference();
 				UserData->PositionBufferSRV = VertexFactory->PositionBufferSRV.GetReference();
 				UserData->TangentBufferSRV  = VertexFactory->TangentBufferSRV.GetReference();
 				UserData->UV0BufferSRV      = VertexFactory->UV0BufferSRV.GetReference();
@@ -310,10 +253,10 @@ private:
 
 	TArray<FComputeDrivenSection> Sections;
 
-	FShaderResourceViewRHIRef  ComponentInstanceBufferSRV;
-	TArray<FBufferRHIRef>      ComponentIndirectArgsBuffers;
+	int32 NumInstancesSnapshot = 0;
 
-	UComputeDrivenIndirectInstancingComponent* OwnerComponent = nullptr;
+	// Shared with the component — outlives both proxy and component destruction.
+	TSharedPtr<FComputeDrivenGpuBuffers> SharedBuffers;
 };
 
 // ============================================================================
@@ -336,6 +279,10 @@ void UComputeDrivenIndirectInstancingComponent::OnRegister()
 {
 	Super::OnRegister();
 	SetMobility(EComponentMobility::Movable);
+
+	// Allocate the shared block here so it exists before CreateSceneProxy.
+	if (!GpuBuffers.IsValid())
+		GpuBuffers = MakeShared<FComputeDrivenGpuBuffers>();
 }
 
 void UComputeDrivenIndirectInstancingComponent::OnUnregister()
@@ -353,28 +300,8 @@ void UComputeDrivenIndirectInstancingComponent::ApplyWorldOffset(
 FBoxSphereBounds UComputeDrivenIndirectInstancingComponent::CalcBounds(
 	const FTransform& LocalToWorld) const
 {
-	// This is a GPU-driven indirect primitive: the CPU has no knowledge of
-	// individual instance positions. The bounds exist only to pass the coarse
-	// scene-level frustum/distance cull so that GetDynamicMeshElements is called.
-	// Per-instance GPU culling (HZB, occlusion) handles fine-grained visibility.
-	//
-	// Key insight: instances are placed ON THE GROUND directly below the capture
-	// camera. CaptureOrigin is the camera's 3D position (e.g. Z = 2,000,000 UU
-	// altitude), but the instances live at roughly Z = 0. Centring the sphere
-	// on CaptureOrigin puts the entire ground grid outside the sphere.
-	//
-	// Correct centre: (CaptureOrigin.XY, 0) — ground projection of the camera.
-	// Correct radius: large enough to cover the entire possible grid footprint
-	// plus a generous vertical margin for sloped terrain and mesh height.
-	const float GridSide     = FMath::Sqrt((float)FMath::Max(MaxInstances, 1));
-	const float HalfGridXY   = (GridSide * 0.5f + 1.0f) * GridCellSize;
-	const float VerticalHalf = 500000.f; // ±5 km vertical range — covers any terrain
-
-	// Sphere centred at the ground footprint of the capture camera.
-	const FVector Centre(CaptureOrigin.X, CaptureOrigin.Y, 0.0);
-	const float   Radius = FMath::Sqrt(HalfGridXY * HalfGridXY * 2.f + VerticalHalf * VerticalHalf);
-
-	return FBoxSphereBounds(Centre, FVector(Radius), Radius);
+	const float WorldHalf = HALF_WORLD_MAX;
+	return FBoxSphereBounds(FVector::ZeroVector, FVector(WorldHalf), WorldHalf);
 }
 
 FPrimitiveSceneProxy* UComputeDrivenIndirectInstancingComponent::CreateSceneProxy()
@@ -382,40 +309,30 @@ FPrimitiveSceneProxy* UComputeDrivenIndirectInstancingComponent::CreateSceneProx
 	if (!Mesh || !Mesh->GetRenderData() ||
 		Mesh->GetRenderData()->LODResources.Num() == 0 ||
 		Mesh->GetRenderData()->LODResources[0].Sections.Num() == 0)
-	{
 		return nullptr;
-	}
+
+	// Reset bReady so the new proxy's CreateRenderThreadResources sets it fresh.
+	if (GpuBuffers.IsValid())
+		GpuBuffers->bReady = false;
 
 	return new FComputeDrivenIndirectInstancingSceneProxy(this);
 }
 
 UMaterialInterface* UComputeDrivenIndirectInstancingComponent::GetMaterial(int32 Index) const
 {
-	if (Mesh)
-		return Mesh->GetMaterial(Index);
-	return nullptr;
+	return Mesh ? Mesh->GetMaterial(Index) : nullptr;
 }
 
-void UComputeDrivenIndirectInstancingComponent::SetMaterial(
-	int32 ElementIndex, UMaterialInterface* InMaterial)
-{
-	// Materials live on the mesh asset — override not supported.
-}
+void UComputeDrivenIndirectInstancingComponent::SetMaterial(int32, UMaterialInterface*) {}
 
 void UComputeDrivenIndirectInstancingComponent::GetUsedMaterials(
-	TArray<UMaterialInterface*>& OutMaterials, bool bGetDebugMaterials) const
+	TArray<UMaterialInterface*>& OutMaterials, bool) const
 {
 	if (!Mesh || !Mesh->GetRenderData() ||
-		Mesh->GetRenderData()->LODResources.Num() == 0)
-		return;
-
-	const FStaticMeshLODResources& LOD = Mesh->GetRenderData()->LODResources[0];
-	for (const FStaticMeshSection& Section : LOD.Sections)
-	{
-		UMaterialInterface* Mat = Mesh->GetMaterial(Section.MaterialIndex);
-		if (Mat)
-			OutMaterials.AddUnique(Mat);
-	}
+		Mesh->GetRenderData()->LODResources.Num() == 0) return;
+	for (const FStaticMeshSection& S : Mesh->GetRenderData()->LODResources[0].Sections)
+		if (UMaterialInterface* M = Mesh->GetMaterial(S.MaterialIndex))
+			OutMaterials.AddUnique(M);
 }
 
 int32 UComputeDrivenIndirectInstancingComponent::GetNumMaterials() const

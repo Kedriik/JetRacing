@@ -105,34 +105,31 @@ void UComputeShaderMeshSpawner::RunComputeShader()
     if (!IndirectInstancingComponent || !DepthRenderTarget)
         return;
 
-    // Keep the component's bounds centred on where instances will actually live
-    // (the capture camera position).  CalcBounds uses both fields to build a
-    // sphere that covers the entire possible instance grid.
-    IndirectInstancingComponent->GridCellSize  = GridCellSize;
-    IndirectInstancingComponent->CaptureOrigin = CameraLocation;
-    IndirectInstancingComponent->UpdateBounds();  // re-evaluates CalcBounds, pushes to renderer
-
-    FBufferRHIRef              CapturedInstanceBuffer    = IndirectInstancingComponent->GpuInstanceBuffer;
-    FUnorderedAccessViewRHIRef CapturedInstanceBufferUAV = IndirectInstancingComponent->GpuInstanceBufferUAV;
-    int32                      CapturedMeshNumIndices    = IndirectInstancingComponent->GpuMeshNumIndices;
-
-    // All section IndirectArgs buffers — the compute shader writes InstanceCount
-    // to buffer[0], then we copy it to the rest.
-    TArray<FBufferRHIRef>              CapturedIndirectBuffers   = IndirectInstancingComponent->GpuIndirectArgsBuffers;
-    TArray<FUnorderedAccessViewRHIRef> CapturedIndirectBufferUAVs = IndirectInstancingComponent->GpuIndirectArgsBufferUAVs;
-
-    if (!CapturedInstanceBuffer.IsValid() || !CapturedInstanceBufferUAV.IsValid() ||
-        CapturedIndirectBuffers.Num() == 0 || CapturedMeshNumIndices <= 0)
+    // Read from the shared GPU buffer block created by the scene proxy.
+    TSharedPtr<FComputeDrivenGpuBuffers> Buffers = IndirectInstancingComponent->GpuBuffers;
+    if (!Buffers.IsValid() || !Buffers->bReady)
     {
         UE_LOG(LogTemp, Warning, TEXT("UComputeShaderMeshSpawner: GPU buffers not ready yet."));
         return;
     }
 
-    for (const FBufferRHIRef& Buf : CapturedIndirectBuffers)
+    FUnorderedAccessViewRHIRef CapturedInstanceBufferUAV = Buffers->InstanceBufferUAV;
+    int32                      CapturedMeshNumIndices    = Buffers->MeshNumIndices;
+
+    TArray<FBufferRHIRef>              CapturedIndirectBuffers    = Buffers->IndirectArgsBuffers;
+    TArray<FUnorderedAccessViewRHIRef> CapturedIndirectBufferUAVs = Buffers->IndirectArgsBufferUAVs;
+    TArray<FBufferRHIRef>              CapturedResetBuffers       = Buffers->IndirectArgsResetBuffers;
+
+    if (!CapturedInstanceBufferUAV.IsValid() ||
+        CapturedIndirectBuffers.Num() == 0 || CapturedMeshNumIndices <= 0 ||
+        CapturedResetBuffers.Num() != CapturedIndirectBuffers.Num())
     {
-        if (!Buf.IsValid())
-            return;
+        UE_LOG(LogTemp, Warning, TEXT("UComputeShaderMeshSpawner: GPU buffers incomplete."));
+        return;
     }
+
+    for (const FBufferRHIRef& Buf : CapturedIndirectBuffers)
+        if (!Buf.IsValid()) return;
 
     FTextureRHIRef CapturedDepthTexture = DepthRenderTarget->GetResource()->TextureRHI;
     if (!CapturedDepthTexture.IsValid())
@@ -153,13 +150,6 @@ void UComputeShaderMeshSpawner::RunComputeShader()
     float  CapturedVertOffset   = VerticalOffset;
     float  CapturedScaleMin     = ScaleMin;
     float  CapturedScaleMax     = ScaleMax;
-
-    TArray<FBufferRHIRef> CapturedResetBuffers = IndirectInstancingComponent->GpuIndirectArgsResetBuffers;
-    if (CapturedResetBuffers.Num() != CapturedIndirectBuffers.Num())
-    {
-        UE_LOG(LogTemp, Warning, TEXT("UComputeShaderMeshSpawner: Reset buffers not ready yet."));
-        return;
-    }
 
     ENQUEUE_RENDER_COMMAND(DispatchFoliageComputeShader)(
         [CapturedInstanceBufferUAV,
