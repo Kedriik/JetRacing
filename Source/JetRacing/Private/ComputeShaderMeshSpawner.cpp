@@ -55,6 +55,19 @@ void UComputeShaderMeshSpawner::SetupDepthCapture()
     SceneCaptureComponent->CaptureSource       = SCS_SceneDepth;
     SceneCaptureComponent->bCaptureEveryFrame  = false;
     SceneCaptureComponent->bCaptureOnMovement  = false;
+    SceneCaptureComponent->ShowFlags.SetDynamicShadows(false);
+    SceneCaptureComponent->ShowFlags.SetCapsuleShadows(false);
+    SceneCaptureComponent->ShowFlags.SetContactShadows(false);
+    SceneCaptureComponent->ShowFlags.SetLighting(false);
+    SceneCaptureComponent->ShowFlags.SetGlobalIllumination(false);
+    SceneCaptureComponent->ShowFlags.SetReflectionEnvironment(false);
+    SceneCaptureComponent->ShowFlags.SetScreenSpaceAO(false);
+    SceneCaptureComponent->ShowFlags.SetAmbientOcclusion(false);
+    SceneCaptureComponent->ShowFlags.SetPostProcessing(false);
+    SceneCaptureComponent->ShowFlags.SetAtmosphere(false);
+    SceneCaptureComponent->ShowFlags.SetFog(false);
+    SceneCaptureComponent->ShowFlags.SetVolumetricFog(false);
+    SceneCaptureComponent->ShowFlags.SetSkyLighting(false);
 
     SceneCaptureComponent->SetWorldLocation(CameraLocation);
     SceneCaptureComponent->SetWorldRotation(CameraRotation);
@@ -72,14 +85,8 @@ void UComputeShaderMeshSpawner::CaptureDepth()
     SceneCaptureComponent->SetWorldRotation(CameraRotation);
     SceneCaptureComponent->OrthoWidth = OrthoWidth;
 
-    bCaptureInProgress = true;
-
-    AsyncTask(ENamedThreads::GameThread, [this]()
-    {
-        if (SceneCaptureComponent)
-            SceneCaptureComponent->CaptureScene();
-        bCaptureInProgress = false;
-    });
+   
+   SceneCaptureComponent->CaptureScene();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -178,7 +185,7 @@ void UComputeShaderMeshSpawner::RunComputeShader()
         (FRHICommandListImmediate& RHICmdList)
         {
             FRDGBuilder GraphBuilder(RHICmdList, RDG_EVENT_NAME("SpawnPositionCompute"));
-
+            const uint32 GroupsY = FMath::DivideAndRoundUp(CapturedNumInstances, 1000u);
             FInstancesComputeShader::FParameters* Parameters =
                 GraphBuilder.AllocParameters<FInstancesComputeShader::FParameters>();
 
@@ -203,7 +210,7 @@ void UComputeShaderMeshSpawner::RunComputeShader()
                 RDG_EVENT_NAME("SpawnPositionPass"),
                 ComputeShader,
                 Parameters,
-                FIntVector(10, 100, 1)
+                FIntVector(1, (int32)GroupsY, 1)
             );
 
             GraphBuilder.Execute();

@@ -16,7 +16,7 @@ float SpawnDensity;
 float VerticalOffset;
 
 float Hash2D(float2 p)
-{
+{   
     return frac(sin(dot(p, float2(127.1, 311.7))) * 43758.5453123);
 }
 
@@ -51,11 +51,14 @@ void MainCS(uint3 ThreadId : SV_DispatchThreadID)
     float worldX = snappedOriginX + ((float)GridX + 0.5) * GridCellSize;
     float worldY = snappedOriginY + ((float)GridY + 0.5) * GridCellSize;
 
-    // Use the stable world-cell coordinates as the hash seed so jitter and
-    // spawn probability are permanently bound to each world cell, not to the
-    // thread index. Divide by GridCellSize so neighbouring cells always
-    // produce different seeds regardless of scale.
-    float2 gridSeed = float2(worldX, worldY) / GridCellSize;
+    // --- FIX 1: Hash seed in integer cell space ---
+    // Previously used float2(worldX, worldY) / GridCellSize as seed directly.
+    // At 20 000 000 units from origin with a small GridCellSize, the seed
+    // values are still large floats (~200 000+), causing sin() to lose
+    // periodicity and produce inconsistent hashes across frames.
+    // round() collapses each cell to a unique small integer, making the seed
+    // perfectly stable regardless of world-space magnitude.
+    float2 gridSeed = round(float2(worldX, worldY) / GridCellSize);
 
     // Per-cell sub-jitter (stays < half a cell so cells never overlap)
     float jitterX = (Hash2D(gridSeed)                        - 0.5) * GridCellSize * 0.9;
@@ -67,6 +70,8 @@ void MainCS(uint3 ThreadId : SV_DispatchThreadID)
     // Project the world-XY sample point back into the depth texture.
     // The capture camera is orthographic looking straight down, so the offset
     // from the camera centre maps linearly to UV.
+    // Note: subtracting CameraPosition here is safe — both sides are large
+    // numbers of the same magnitude so the difference is well-conditioned.
     float2 camOffset;
     camOffset.x = dot(float3(sampleWorldX - CameraPosition.x, sampleWorldY - CameraPosition.y, 0.0), CameraRight);
     camOffset.y = dot(float3(sampleWorldX - CameraPosition.x, sampleWorldY - CameraPosition.y, 0.0), CameraUp);
@@ -93,19 +98,35 @@ void MainCS(uint3 ThreadId : SV_DispatchThreadID)
         float spawnRandom = Hash2D(gridSeed + float2(100.0, 200.0));
         bool shouldSpawn  = spawnRandom < SpawnDensity;
 
-        if (shouldSpawn)
+       if (shouldSpawn)
         {
-            // Reconstruct world Z from the depth sample using the camera ray
-            float3 worldPosition = CameraPosition
-                                 + (camOffset.x * CameraRight)
-                                 + (camOffset.y * CameraUp)
-                                 + (depth * CameraForward);
-
-            // Apply vertical offset along world Z
-            worldPosition.z += VerticalOffset;
+            // --- FIX 2: Reconstruct world position without adding a small
+            // offset to a huge CameraPosition ---
+            //
+            // The original code did:
+            //   worldPosition = CameraPosition + camOffset.x*CameraRight
+            //                                  + camOffset.y*CameraUp
+            //                                  + depth*CameraForward;
+            //
+            // At 20 000 000 units from origin, CameraPosition components are
+            // ~2e7. camOffset is bounded by the ortho frustum (hundreds to
+            // thousands of units). Adding a small float to a float of magnitude
+            // 2e7 loses the low-order bits of camOffset entirely, so the XY
+            // position snaps to coarse float32 increments and flickers as the
+            // camera moves sub-unit amounts.
+            //
+            // Fix: use the already-stable sampleWorldX/Y for XY (they were
+            // built from a grid-snapped base, so they are correct large floats).
+            // For Z, mirror the VertexFactory approach: subtract depth from
+            // the camera altitude. Both operands are in the same numerical
+            // range so cancellation is benign and the result is the terrain
+            // altitude — a small, well-conditioned number.
+            float worldZ = CameraPosition.z - depth + VerticalOffset;
+            float3 worldPosition = float3(sampleWorldX, sampleWorldY, worldZ);
 
             float scaleVariation = 0.7 + Hash2D(gridSeed + float2(7.0, 8.0)) * 0.6;
             result = float4(worldPosition, scaleVariation);
+            
         }
         else
         {
