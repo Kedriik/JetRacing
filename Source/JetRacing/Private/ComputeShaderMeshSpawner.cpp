@@ -210,7 +210,7 @@ void UComputeShaderMeshSpawner::RunComputeShader()
                 RDG_EVENT_NAME("SpawnPositionPass"),
                 ComputeShader,
                 Parameters,
-                FIntVector(1, (int32)GroupsY, 1)
+                FIntVector(10, (int32)100, 1)
             );
 
             GraphBuilder.Execute();

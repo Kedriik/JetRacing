@@ -16,7 +16,7 @@ float SpawnDensity;
 float VerticalOffset;
 
 float Hash2D(float2 p)
-{   
+{
     return frac(sin(dot(p, float2(127.1, 311.7))) * 43758.5453123);
 }
 
@@ -24,64 +24,90 @@ float Hash2D(float2 p)
 void MainCS(uint3 ThreadId : SV_DispatchThreadID)
 {
     uint Width = 10;
-    uint X = ThreadId.x; // Column
-    uint Y = ThreadId.y; // Row
+    uint X = ThreadId.x;
+    uint Y = ThreadId.y;
     uint Index = Y * Width + X;
 
     if (Index >= NumInstances)
         return;
 
-    uint GridWidth = (uint)sqrt((float)NumInstances);
+    uint GridWidth  = (uint)sqrt((float)NumInstances);
     uint GridHeight = GridWidth;
 
     uint GridX = Index % GridWidth;
     uint GridY = Index / GridWidth;
 
-    // --- World-space snapped grid origin ---
-    // Snap the camera's XY position to the nearest GridCellSize boundary so the
-    // grid is fixed in world space. The grid origin shifts only in discrete
-    // cell-sized steps, never continuously with the camera.
-    float totalGridWidth  = GridCellSize * (float)GridWidth;
-    float totalGridHeight = GridCellSize * (float)GridHeight;
+    float camRadius = length(CameraPosition);
 
-    float snappedOriginX = floor(CameraPosition.x / GridCellSize) * GridCellSize - totalGridWidth  * 0.5;
-    float snappedOriginY = floor(CameraPosition.y / GridCellSize) * GridCellSize - totalGridHeight * 0.5;
+    // cellRad converts GridCellSize (metres) to radians.
+    // MUST be constant every frame — if we derive it from camRadius, any
+    // altitude change shifts all floor() snap boundaries and the grid shuffles.
+    // Hardcode the planet surface radius here instead.
+    static const float PlanetRadius = 16000000.0f; // <-- set to your planet radius in UE units
+    float cellRad = GridCellSize / PlanetRadius;
 
-    // World-space XY centre of this cell
-    float worldX = snappedOriginX + ((float)GridX + 0.5) * GridCellSize;
-    float worldY = snappedOriginY + ((float)GridY + 0.5) * GridCellSize;
+    // -------------------------------------------------------------------------
+    // STEP 1: Snap in lon/lat — the only coordinate system that is truly
+    // discrete and world-fixed on a sphere. These are pure functions of the
+    // camera footprint direction, containing zero altitude or orientation info.
+    // -------------------------------------------------------------------------
+    float3 footDir = normalize(CameraPosition);
+    float camLon = atan2(footDir.y, footDir.x);
+    float camLat = asin(clamp(footDir.z, -1.0, 1.0));
 
-    // --- FIX 1: Hash seed in integer cell space ---
-    // Previously used float2(worldX, worldY) / GridCellSize as seed directly.
-    // At 20 000 000 units from origin with a small GridCellSize, the seed
-    // values are still large floats (~200 000+), causing sin() to lose
-    // periodicity and produce inconsistent hashes across frames.
-    // round() collapses each cell to a unique small integer, making the seed
-    // perfectly stable regardless of world-space magnitude.
-    float2 gridSeed = round(float2(worldX, worldY) / GridCellSize);
+    // Snap to cell boundaries.
+    float snappedLon = floor(camLon / cellRad) * cellRad;
+    float snappedLat = floor(camLat / cellRad) * cellRad;
 
-    // Per-cell sub-jitter (stays < half a cell so cells never overlap)
-    float jitterX = (Hash2D(gridSeed)                        - 0.5) * GridCellSize * 0.9;
-    float jitterY = (Hash2D(gridSeed + float2(42.0, 13.0))   - 0.5) * GridCellSize * 0.9;
+    // Integer cell index for this thread, centred on camera.
+    int cellX = (int)GridX - (int)(GridWidth  / 2);
+    int cellY = (int)GridY - (int)(GridHeight / 2);
 
-    float sampleWorldX = worldX + jitterX;
-    float sampleWorldY = worldY + jitterY;
+    // Lon/lat of this cell — world-fixed, integer steps from snapped origin.
+    float cellLon = snappedLon + (float)cellX * cellRad;
+    float cellLat = snappedLat + (float)cellY * cellRad;
 
-    // Project the world-XY sample point back into the depth texture.
-    // The capture camera is orthographic looking straight down, so the offset
-    // from the camera centre maps linearly to UV.
-    // Note: subtracting CameraPosition here is safe — both sides are large
-    // numbers of the same magnitude so the difference is well-conditioned.
-    float2 camOffset;
-    camOffset.x = dot(float3(sampleWorldX - CameraPosition.x, sampleWorldY - CameraPosition.y, 0.0), CameraRight);
-    camOffset.y = dot(float3(sampleWorldX - CameraPosition.x, sampleWorldY - CameraPosition.y, 0.0), CameraUp);
+    // -------------------------------------------------------------------------
+    // STEP 2: Stable integer seed from cell lon/lat indices.
+    // round() gives the same integers for the same cell regardless of anything.
+    // -------------------------------------------------------------------------
+    float2 gridSeed = float2(
+        round(cellLon / cellRad),
+        round(cellLat / cellRad)
+    );
+
+    // -------------------------------------------------------------------------
+    // STEP 3: Per-cell jitter in angular space — world-fixed, seed-only.
+    // -------------------------------------------------------------------------
+    float jitterLon = (Hash2D(gridSeed)                      - 0.5) * cellRad * 0.9;
+    float jitterLat = (Hash2D(gridSeed + float2(42.0, 13.0)) - 0.5) * cellRad * 0.9;
+
+    float sampleLon = cellLon + jitterLon;
+    float sampleLat = cellLat + jitterLat;
+
+    // -------------------------------------------------------------------------
+    // STEP 4: Convert lon/lat to 3D world position at camera radius.
+    // This point is world-fixed and stable.
+    // -------------------------------------------------------------------------
+    float cosLat     = cos(sampleLat);
+    float3 sampleDir = float3(cosLat * cos(sampleLon),
+                              cosLat * sin(sampleLon),
+                              sin(sampleLat));
+
+    float3 sampleWorld = sampleDir * PlanetRadius;
+
+    // -------------------------------------------------------------------------
+    // STEP 5: UV — project 3D offset onto camera Right/Up.
+    // -------------------------------------------------------------------------
+    float3 worldOffset = sampleWorld - CameraPosition;
+    float offsetRight  = dot(worldOffset, CameraRight);
+    float offsetUp     = dot(worldOffset, CameraUp);
 
     float2 uv;
-    uv.x =  camOffset.x / OrthoWidth  + 0.5;
-    uv.y = -camOffset.y / OrthoHeight + 0.5;   // V is flipped in UE render targets
+    uv.x =  offsetRight / OrthoWidth  + 0.5;
+    uv.y = -offsetUp    / OrthoHeight + 0.5;
     uv = saturate(uv);
 
-    // Sample depth
     float depth = SceneDepthTexture.SampleLevel(SceneDepthSampler, uv, 0);
 
     bool didHit = depth > 0.0;
@@ -94,39 +120,23 @@ void MainCS(uint3 ThreadId : SV_DispatchThreadID)
     }
     else
     {
-        // Apply spawn probability - keyed on world cell so it never flickers
         float spawnRandom = Hash2D(gridSeed + float2(100.0, 200.0));
         bool shouldSpawn  = spawnRandom < SpawnDensity;
 
-       if (shouldSpawn)
+        if (shouldSpawn)
         {
-            // --- FIX 2: Reconstruct world position without adding a small
-            // offset to a huge CameraPosition ---
-            //
-            // The original code did:
-            //   worldPosition = CameraPosition + camOffset.x*CameraRight
-            //                                  + camOffset.y*CameraUp
-            //                                  + depth*CameraForward;
-            //
-            // At 20 000 000 units from origin, CameraPosition components are
-            // ~2e7. camOffset is bounded by the ortho frustum (hundreds to
-            // thousands of units). Adding a small float to a float of magnitude
-            // 2e7 loses the low-order bits of camOffset entirely, so the XY
-            // position snaps to coarse float32 increments and flickers as the
-            // camera moves sub-unit amounts.
-            //
-            // Fix: use the already-stable sampleWorldX/Y for XY (they were
-            // built from a grid-snapped base, so they are correct large floats).
-            // For Z, mirror the VertexFactory approach: subtract depth from
-            // the camera altitude. Both operands are in the same numerical
-            // range so cancellation is benign and the result is the terrain
-            // altitude — a small, well-conditioned number.
-            float worldZ = CameraPosition.z - depth + VerticalOffset;
-            float3 worldPosition = float3(sampleWorldX, sampleWorldY, worldZ);
+            // Surface point: travel from sampleWorld toward sphere centre by depth.
+            // sampleDir is stable (world-fixed), depth gives terrain radius.
+            // Equivalent of flat shader's CameraPosition.z - depth.
+            float3 surfacePoint  = sampleDir * (camRadius - depth);
+            float3 worldPosition = surfacePoint + sampleDir * VerticalOffset;
 
             float scaleVariation = 0.7 + Hash2D(gridSeed + float2(7.0, 8.0)) * 0.6;
-            result = float4(worldPosition, scaleVariation);
-            
+            int meshesCount = 5;
+            int   meshIndex      = (int)(Hash2D(gridSeed + float2(53.0, 31.0)) * meshesCount);
+            // Pack: integer part = meshIndex, fractional part = scaleVariation (0.7-1.3)
+            // Since scaleVariation < 2.0, meshIndex*10 + scaleVariation is unambiguous
+            result = float4(worldPosition, (float)meshIndex * 10.0 + scaleVariation);
         }
         else
         {
