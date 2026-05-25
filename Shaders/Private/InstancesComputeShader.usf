@@ -20,6 +20,59 @@ float Hash2D(float2 p)
     return frac(sin(dot(p, float2(127.1, 311.7))) * 43758.5453123);
 }
 
+// -------------------------------------------------------------------------
+// CUBE MAP FACE PROJECTION
+//
+// Projects a unit direction onto one of 6 cube faces.
+// Returns:
+//   faceIndex  — which face (0=+X, 1=-X, 2=+Y, 3=-Y, 4=+Z, 5=-Z)
+//   uv         — 2D coordinates on that face in [-1,1]
+//
+// Each face uses two of the three XYZ components divided by the dominant one.
+// This gives uniform, singularity-free coverage of the entire sphere.
+// The cell size in uv space corresponds to a consistent physical arc length
+// everywhere on each face (with mild ~41% variation face-centre to corner,
+// much better than lon/lat's infinite squish at poles).
+// -------------------------------------------------------------------------
+void DirToCubeFace(float3 dir, out int faceIndex, out float2 uv)
+{
+    float3 absDir = abs(dir);
+    if (absDir.x >= absDir.y && absDir.x >= absDir.z)
+    {
+        faceIndex = dir.x > 0 ? 0 : 1;
+        float s   = 1.0 / absDir.x;
+        uv = dir.x > 0 ? float2(-dir.z, dir.y) * s
+                       : float2( dir.z, dir.y) * s;
+    }
+    else if (absDir.y >= absDir.x && absDir.y >= absDir.z)
+    {
+        faceIndex = dir.y > 0 ? 2 : 3;
+        float s   = 1.0 / absDir.y;
+        uv = dir.y > 0 ? float2( dir.x, -dir.z) * s
+                       : float2( dir.x,  dir.z) * s;
+    }
+    else
+    {
+        faceIndex = dir.z > 0 ? 4 : 5;
+        float s   = 1.0 / absDir.z;
+        uv = dir.z > 0 ? float2( dir.x, dir.y) * s
+                       : float2(-dir.x, dir.y) * s;
+    }
+}
+
+// Convert cube face + uv back to unit direction.
+float3 CubeFaceToDir(int faceIndex, float2 uv)
+{
+    float3 dir;
+    if      (faceIndex == 0) dir = normalize(float3( 1,  uv.y, -uv.x));
+    else if (faceIndex == 1) dir = normalize(float3(-1,  uv.y,  uv.x));
+    else if (faceIndex == 2) dir = normalize(float3( uv.x, 1, -uv.y));
+    else if (faceIndex == 3) dir = normalize(float3( uv.x,-1,  uv.y));
+    else if (faceIndex == 4) dir = normalize(float3( uv.x,  uv.y,  1));
+    else                     dir = normalize(float3(-uv.x,  uv.y, -1));
+    return dir;
+}
+
 [numthreads(10, 100, 1)]
 void MainCS(uint3 ThreadId : SV_DispatchThreadID)
 {
@@ -39,69 +92,66 @@ void MainCS(uint3 ThreadId : SV_DispatchThreadID)
 
     float camRadius = length(CameraPosition);
 
-    // cellRad converts GridCellSize (metres) to radians.
-    // MUST be constant every frame — if we derive it from camRadius, any
-    // altitude change shifts all floor() snap boundaries and the grid shuffles.
-    // Hardcode the planet surface radius here instead.
-    static const float PlanetRadius = 16000000.0f; // <-- set to your planet radius in UE units
-    float cellRad = GridCellSize / PlanetRadius;
+    static const float PlanetRadius = 16000000.0f;
+
+    // Cell size in cube-face UV space.
+    // The cube face spans [-1,1] = 2 units across.
+    // Physical arc length of 2 units on a cube face ≈ PI/2 * PlanetRadius.
+    // So: cellUV = GridCellSize / (PlanetRadius * PI / 4)  (approx, face centre)
+    // Simpler: use GridCellSize / PlanetRadius * (2/PI) so it roughly matches metres.
+    static const float PI = 3.14159265;
+    float cellUV = GridCellSize / PlanetRadius * (2.0 / PI);
 
     // -------------------------------------------------------------------------
-    // STEP 1: Snap in lon/lat — the only coordinate system that is truly
-    // discrete and world-fixed on a sphere. These are pure functions of the
-    // camera footprint direction, containing zero altitude or orientation info.
+    // Project camera footprint onto cube face — world-fixed, no singularity.
     // -------------------------------------------------------------------------
     float3 footDir = normalize(CameraPosition);
-    float camLon = atan2(footDir.y, footDir.x);
-    float camLat = asin(clamp(footDir.z, -1.0, 1.0));
+    int    faceIndex;
+    float2 footUV;
+    DirToCubeFace(footDir, faceIndex, footUV);
 
-    // Snap to cell boundaries.
-    float snappedLon = floor(camLon / cellRad) * cellRad;
-    float snappedLat = floor(camLat / cellRad) * cellRad;
+    // Snap footprint UV to cell grid on this face.
+    int footCellX = (int)floor(footUV.x / cellUV);
+    int footCellY = (int)floor(footUV.y / cellUV);
 
-    // Integer cell index for this thread, centred on camera.
+    // Integer offset for this thread, centred on camera.
     int cellX = (int)GridX - (int)(GridWidth  / 2);
     int cellY = (int)GridY - (int)(GridHeight / 2);
 
-    // Lon/lat of this cell — world-fixed, integer steps from snapped origin.
-    float cellLon = snappedLon + (float)cellX * cellRad;
-    float cellLat = snappedLat + (float)cellY * cellRad;
+    // Global cell address on this face — world-fixed.
+    int globalX = footCellX + cellX;
+    int globalY = footCellY + cellY;
 
-    // -------------------------------------------------------------------------
-    // STEP 2: Stable integer seed from cell lon/lat indices.
-    // round() gives the same integers for the same cell regardless of anything.
-    // -------------------------------------------------------------------------
+    // Seed includes face index to prevent cells from different faces colliding.
     float2 gridSeed = float2(
-        round(cellLon / cellRad),
-        round(cellLat / cellRad)
+        (float)globalX + (float)faceIndex * 100000.0,
+        (float)globalY + (float)faceIndex * 99999.0
     );
 
     // -------------------------------------------------------------------------
-    // STEP 3: Per-cell jitter in angular space — world-fixed, seed-only.
+    // Jitter — world-fixed, seed-only.
     // -------------------------------------------------------------------------
-    float jitterLon = (Hash2D(gridSeed)                      - 0.5) * cellRad * 0.9;
-    float jitterLat = (Hash2D(gridSeed + float2(42.0, 13.0)) - 0.5) * cellRad * 0.9;
-
-    float sampleLon = cellLon + jitterLon;
-    float sampleLat = cellLat + jitterLat;
+    float jitterU = (Hash2D(gridSeed)                      - 0.5) * cellUV * 0.9;
+    float jitterV = (Hash2D(gridSeed + float2(42.0, 13.0)) - 0.5) * cellUV * 0.9;
 
     // -------------------------------------------------------------------------
-    // STEP 4: Convert lon/lat to 3D world position at camera radius.
-    // This point is world-fixed and stable.
+    // Sample UV on cube face — derived purely from global cell address + jitter.
+    // No camera vectors, no footDir involved.
     // -------------------------------------------------------------------------
-    float cosLat     = cos(sampleLat);
-    float3 sampleDir = float3(cosLat * cos(sampleLon),
-                              cosLat * sin(sampleLon),
-                              sin(sampleLat));
+    float2 sampleUV = float2(
+        ((float)globalX + 0.5) * cellUV + jitterU,
+        ((float)globalY + 0.5) * cellUV + jitterV
+    );
 
-    float3 sampleWorld = sampleDir * PlanetRadius;
+    // Convert back to unit direction — world-fixed, stable.
+    float3 sampleDir = CubeFaceToDir(faceIndex, sampleUV);
 
     // -------------------------------------------------------------------------
-    // STEP 5: UV — project 3D offset onto camera Right/Up.
+    // UV into depth texture — angular delta, no large float subtraction.
     // -------------------------------------------------------------------------
-    float3 worldOffset = sampleWorld - CameraPosition;
-    float offsetRight  = dot(worldOffset, CameraRight);
-    float offsetUp     = dot(worldOffset, CameraUp);
+    float3 angularDelta = sampleDir - footDir;
+    float offsetRight   = dot(angularDelta, CameraRight) * PlanetRadius;
+    float offsetUp      = dot(angularDelta, CameraUp)    * PlanetRadius;
 
     float2 uv;
     uv.x =  offsetRight / OrthoWidth  + 0.5;
@@ -125,17 +175,12 @@ void MainCS(uint3 ThreadId : SV_DispatchThreadID)
 
         if (shouldSpawn)
         {
-            // Surface point: travel from sampleWorld toward sphere centre by depth.
-            // sampleDir is stable (world-fixed), depth gives terrain radius.
-            // Equivalent of flat shader's CameraPosition.z - depth.
             float3 surfacePoint  = sampleDir * (camRadius - depth);
             float3 worldPosition = surfacePoint + sampleDir * VerticalOffset;
 
             float scaleVariation = 0.7 + Hash2D(gridSeed + float2(7.0, 8.0)) * 0.6;
-            int meshesCount = 5;
+            int   meshesCount    = 5;
             int   meshIndex      = (int)(Hash2D(gridSeed + float2(53.0, 31.0)) * meshesCount);
-            // Pack: integer part = meshIndex, fractional part = scaleVariation (0.7-1.3)
-            // Since scaleVariation < 2.0, meshIndex*10 + scaleVariation is unambiguous
             result = float4(worldPosition, (float)meshIndex * 10.0 + scaleVariation);
         }
         else
