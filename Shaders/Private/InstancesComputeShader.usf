@@ -110,9 +110,15 @@ void MainCS(uint3 ThreadId : SV_DispatchThreadID)
     float2 footUV;
     DirToCubeFace(footDir, faceIndex, footUV);
 
-    // Snap footprint UV to cell grid on this face.
+    // Snap using plain cellUV only — gives perfectly stable discrete steps
+    // with no boundary oscillation. Distortion correction is applied only
+    // when converting cell address back to UV (below), not during snapping.
     int footCellX = (int)floor(footUV.x / cellUV);
     int footCellY = (int)floor(footUV.y / cellUV);
+
+    // Distortion at the snapped cell centre — used only for cell position,
+    // never for snapping itself.
+    // No distortion correction needed for snapping or UV — plain cellUV used throughout.
 
     // Integer offset for this thread, centred on camera.
     int cellX = (int)GridX - (int)(GridWidth  / 2);
@@ -129,15 +135,13 @@ void MainCS(uint3 ThreadId : SV_DispatchThreadID)
     );
 
     // -------------------------------------------------------------------------
-    // Jitter — world-fixed, seed-only.
+    // Jitter and sample UV — all in plain cellUV space (same as snapping).
+    // Distortion is NOT applied here — it is only used for converting the
+    // final sampleUV back to a world direction via CubeFaceToDir.
     // -------------------------------------------------------------------------
     float jitterU = (Hash2D(gridSeed)                      - 0.5) * cellUV * 0.9;
     float jitterV = (Hash2D(gridSeed + float2(42.0, 13.0)) - 0.5) * cellUV * 0.9;
 
-    // -------------------------------------------------------------------------
-    // Sample UV on cube face — derived purely from global cell address + jitter.
-    // No camera vectors, no footDir involved.
-    // -------------------------------------------------------------------------
     float2 sampleUV = float2(
         ((float)globalX + 0.5) * cellUV + jitterU,
         ((float)globalY + 0.5) * cellUV + jitterV
